@@ -10,7 +10,7 @@ Based on the original [CODA](https://github.com/ashleylk/CODA) pipeline (Kiemen 
 pip install path3d
 ```
 
-Optional extras:
+Modules:
 
 ```bash
 pip install "path3d[czi]"            # Zeiss CZI support
@@ -33,15 +33,6 @@ The `registration` extra requires a Java runtime (VALIS uses Bio-Formats).
 | 3DHISTECH MRXS | `.mrxs` | openslide |
 | Zeiss CZI | `.czi` | aicspylibczi *(optional)* |
 
-## Conventions
-
-- Coordinates are 0-based; 2D is `(row, col)` = `(y, x)`, 3D is `(z, row, col)`
-- Physical units are microns
-- `read_region` always returns `(H, W, 3)` uint8 RGB — alpha is stripped
-
-## Documentation
-
-See [`docs/`](docs/) for the pipeline overview, algorithm notes, and references.
 
 ## License
 
