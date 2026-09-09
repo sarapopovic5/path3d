@@ -1,0 +1,71 @@
+# ─── Local scratch — never committed ──────────────────────────────────────────
+# Put ad-hoc experiments, personal test scripts, and machine-specific paths here.
+scratch/
+local/
+
+# ─── Data and model artifacts ─────────────────────────────────────────────────
+*.czi
+*.svs
+*.ndpi
+*.scn
+*.mrxs
+*.zarr/
+*.pt
+*.pth
+*.ckpt
+manifest*.csv
+qc_report*.csv
+extracted_tiles/
+training_data*/
+qc_overlays/
+*_volume/
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+sdist/
+wheels/
+*.egg-info/
+*.egg
+MANIFEST
+
+# ─── Environments ─────────────────────────────────────────────────────────────
+.env
+.envrc
+.venv
+venv/
+ENV/
+
+# ─── Testing and linting ──────────────────────────────────────────────────────
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ─── Notebooks ────────────────────────────────────────────────────────────────
+.ipynb_checkpoints
+
+# ─── Editors and OS ───────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+pyrightconfig.json
+
+# ─── Local planning notes ─────────────────────────────────────────────────────
+.planning/
+notes/

@@ -1,0 +1,95 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "path3d"
+version = "0.1.0"
+description = "3D reconstruction of large tissues at cellular resolution from serially sectioned H&E whole slide images"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Sara Popovic", email = "sapopovic@ohri.ca" }]
+keywords = [
+    "histology",
+    "whole-slide-imaging",
+    "digital-pathology",
+    "3d-reconstruction",
+    "image-registration",
+    "segmentation",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+
+dependencies = [
+    "numpy>=1.24,<2.0",   # valis-wsi requires numpy<2; xarray-dataclass>=3 requires numpy>=2
+    "openslide-python",
+    "openslide-bin",      # bundles libopenslide as a pip wheel — no system install needed
+    "scikit-image>=0.20", # regionprops_table(..., spacing=...) added in 0.20.0
+    "scipy",
+    "torchstain",
+    "torch",
+    "torchvision",
+    "pandas",
+    "tqdm",
+    "timm",
+    "huggingface_hub",
+    "tifffile",
+    "Pillow",
+    "cellpose",
+]
+
+[project.optional-dependencies]
+czi = ["aicspylibczi"]
+registration = [
+    "valis-wsi",
+    "opencv-contrib-python-headless<4.12.0", # 4.12 is last release supporting numpy<2
+    "pyvips-binary",                          # bundles libvips as a pip wheel
+]
+deeperhistreg = ["deeperhistreg", "SimpleITK", "Pillow"]
+zeroreg3d = ["opencv-python"]
+segmentation = ["spatialdata", "transformers>=4.35.0"]
+nuclear_detection = ["cellpose", "zarr>=2.16,<3"]
+training = ["segmentation-models-pytorch", "albumentations"]
+volume = ["spatialdata>=0.3.0,<0.4.0", "zarr>=2.16,<3", "pyarrow"]
+# napari 0.8.0+ and napari-spatialdata 0.7.0+ require Python >=3.11; 0.7.1 /
+# 0.6.0 are the last releases compatible with requires-python = ">=3.10".
+# napari does not bundle a Qt backend itself, hence the [pyqt5] extra marker.
+viz = [
+    "napari[pyqt5]==0.7.1",
+    "napari-spatialdata==0.6.0",
+    "spatialdata>=0.3.0,<0.4.0",
+]
+dev = ["pytest", "ruff", "matplotlib"]
+all = [
+    "aicspylibczi",
+    "valis-wsi",
+    "spatialdata>=0.3.0,<0.4.0",
+    "opencv-contrib-python-headless<4.12.0",
+    "deeperhistreg",
+    "SimpleITK",
+    "Pillow",
+    "opencv-python",
+    "segmentation-models-pytorch",
+    "albumentations",
+    "zarr>=2.16,<3",
+    "pyarrow",
+    "napari[pyqt5]==0.7.1",
+    "napari-spatialdata==0.6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/sarapopovic5/path3d"
+Repository = "https://github.com/sarapopovic5/path3d"
+Issues = "https://github.com/sarapopovic5/path3d/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/path3d"]

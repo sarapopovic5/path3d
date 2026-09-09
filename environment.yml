@@ -1,0 +1,17 @@
+name: path3d
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - openslide-python
+  - pip
+  - pip:
+    - numpy
+    - scikit-image
+    - torch
+    - torchstain
+    - torchvision
+    - pytest
+    - ruff
+    - -e ".[dev]"
