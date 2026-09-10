@@ -69,21 +69,19 @@ viz = [
     "spatialdata>=0.3.0,<0.4.0",
 ]
 dev = ["pytest", "ruff", "matplotlib"]
+# Everything except [zeroreg3d]: its opencv-python and the
+# opencv-contrib-python-headless in [registration] both install a `cv2`
+# module, so the two cannot coexist. The headless contrib build is the
+# superset (minus GUI windows, which the pipeline never opens), so it wins.
 all = [
-    "aicspylibczi",
-    "valis-wsi",
-    "spatialdata>=0.3.0,<0.4.0",
-    "opencv-contrib-python-headless<4.12.0",
-    "deeperhistreg",
-    "SimpleITK",
-    "Pillow",
-    "opencv-python",
-    "segmentation-models-pytorch",
-    "albumentations",
-    "zarr>=2.16,<3",
-    "pyarrow",
-    "napari[pyqt5]==0.7.1",
-    "napari-spatialdata==0.6.0",
+    "path3d[czi]",
+    "path3d[registration]",
+    "path3d[deeperhistreg]",
+    "path3d[segmentation]",
+    "path3d[nuclear_detection]",
+    "path3d[training]",
+    "path3d[volume]",
+    "path3d[viz]",
 ]
 
 [project.urls]
