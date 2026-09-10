@@ -22,6 +22,20 @@ pip install "path3d[all]"            # everything
 The `registration` extra requires a Java runtime (VALIS uses Bio-Formats).
 `openslide` and `libvips` are bundled as pip wheels — no system install needed.
 
+### Development environment (conda)
+
+`environment.yml` builds an env with every extra installed and a bundled JDK,
+so VALIS registration works without a system Java:
+
+```bash
+conda env create -f environment.yml
+conda activate path3d
+```
+
+Python dependencies are not duplicated in `environment.yml` — it installs the
+project with `pip install -e .[all,dev]`, so `pyproject.toml` stays the single
+source of truth.
+
 ## Supported formats
 
 | Format | Extension | Backend |

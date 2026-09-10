@@ -1,17 +1,24 @@
+# Development environment for path3d.
+#
+#   conda env create -f environment.yml     (or: mamba env create -f environment.yml)
+#   conda activate path3d
+#
+# Python dependencies are deliberately NOT duplicated here — they live in
+# pyproject.toml and are pulled in by the editable install below, so the two
+# never drift. Conda supplies only what pip cannot:
+#   * python 3.10  — napari 0.7.1 / napari-spatialdata 0.6.0 pins in [viz]
+#   * openjdk      — VALIS registration shells out to Bio-Formats (needs a JRE)
+# openslide and libvips arrive as pip wheels (openslide-bin, pyvips-binary),
+# so they are left out of the conda side to avoid two copies of each dylib.
 name: path3d
 channels:
   - conda-forge
-  - defaults
 dependencies:
   - python=3.10
-  - openslide-python
   - pip
+  - setuptools<81 # xarray-schema (via spatialdata) imports pkg_resources,
+  #                 which setuptools 81 deprecates and 82 removed
+  - openjdk=21
   - pip:
-    - numpy
-    - scikit-image
-    - torch
-    - torchstain
-    - torchvision
-    - pytest
-    - ruff
-    - -e ".[dev]"
+      # every optional extra, plus the dev tools
+      - --editable .[all,dev]
