@@ -332,6 +332,7 @@ def tile_grid(
     *,
     tile_um: float = TILE_UM,
     fov_um: float = FOV_UM,
+    stride: int = 1,
 ) -> pd.DataFrame:
     """Build the on-tissue tile table for one section.
 
@@ -343,11 +344,22 @@ def tile_grid(
             script derived ``scale`` from the mask pyramid level.
         tile_um: grid cell side, microns.
         fov_um: image window side fed to UNI2-h, microns.
+        stride: keep every ``stride``-th grid cell in each axis, for a fast
+            full-extent preview at 1/stride^2 the cost. Tiles stay on their
+            original grid positions, so the result rasterises correctly -- it
+            is simply sparser, and ``rasterize_tiles`` leaves the skipped cells
+            NaN. ``1`` (the default) predicts every tile.
 
     Returns:
         DataFrame with ``cx_px, cy_px, x0_px, y0_px`` -- one row per tile whose
         centre is on tissue and whose full window fits inside the canvas.
+
+    Raises:
+        ValueError: ``stride`` is not a positive integer.
     """
+    if stride < 1:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+
     w0, h0 = canvas_wh_px
     step = tile_um / mpp
     fov = int(round(fov_um / mpp))
@@ -355,7 +367,11 @@ def tile_grid(
 
     scale = tissue.shape[1] / w0
 
-    gy, gx = np.mgrid[0:ny, 0:nx]
+    # Subsampling the GRID (not the resulting tile list) keeps the kept tiles
+    # on their exact original cell centres, so floor(cx_px / step) still
+    # recovers the right cell and a strided preview lands in the same raster
+    # as a full run.
+    gy, gx = np.mgrid[0:ny:stride, 0:nx:stride]
     cx = (gx + 0.5) * step
     cy = (gy + 0.5) * step
     si = np.clip((cy * scale).astype(int), 0, tissue.shape[0] - 1)
@@ -438,6 +454,69 @@ def load_encoder(device: str | None = None):
     return model, device, dtype
 
 
+def tile_fingerprint(tiles: pd.DataFrame, mpp: float, fov_um: float) -> str:
+    """Stable hash of the exact tile set an embedding cache belongs to.
+
+    Guards against the failure that makes caching worse than useless: silently
+    reusing embeddings computed for a DIFFERENT tile set. Any change to the
+    tile coordinates, the resolution or the window size produces a different
+    fingerprint and invalidates the cache.
+    """
+    import hashlib
+
+    h = hashlib.sha256()
+    for column in ("cx_px", "cy_px", "x0_px", "y0_px"):
+        h.update(np.ascontiguousarray(tiles[column].to_numpy(np.int64)).tobytes())
+    h.update(f"{mpp:.10g}|{fov_um:.10g}|{_EMBED_DIM}".encode())
+    return h.hexdigest()
+
+
+def load_embedding_cache(
+    cache_path: str | Path,
+) -> tuple[np.ndarray, np.ndarray, str] | None:
+    """Load an embedding cache written by :func:`embed_tiles`.
+
+    Returns:
+        ``(emb, done, fingerprint)`` -- the ``(N, 1536)`` float16 embeddings,
+        an ``(N,)`` bool mask of which rows are computed, and the tile-set
+        fingerprint. ``None`` if the file is absent or unreadable.
+
+    The embeddings are the only expensive part of the pipeline (UNI2-h at a
+    few tiles/s); the classifier on top runs in milliseconds. Load a cache to
+    re-score a slide with a different quantile, or with a retrained
+    classifier, without paying for the encoder again::
+
+        emb, done, _ = load_embedding_cache("out/embeddings.npz")
+        p, cols = classify_embeddings(emb[done], load_model(), quantile=0.9)
+    """
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+    try:
+        with np.load(cache_path) as z:
+            return z["emb"], z["done"], str(z["fingerprint"])
+    except (OSError, KeyError, ValueError, EOFError):
+        return None
+
+
+def _write_embedding_cache(
+    cache_path: Path, emb: np.ndarray, done: np.ndarray, fingerprint: str
+) -> None:
+    """Atomically persist the cache: write a temp file, then rename over.
+
+    A rename is atomic on POSIX, so a kill part-way through a write leaves the
+    previous good cache intact rather than a truncated file.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+    # Write through an open handle, NOT a path: np.savez appends ".npz" to any
+    # path that lacks it, which would silently put the data at
+    # "<name>.npz.tmp.npz" and leave the rename below pointing at nothing.
+    with open(tmp, "wb") as fh:
+        np.savez(fh, emb=emb, done=done, fingerprint=np.array(fingerprint))
+    tmp.replace(cache_path)
+
+
 def embed_tiles(
     level0,
     tiles: pd.DataFrame,
@@ -449,11 +528,19 @@ def embed_tiles(
     batch: int = BATCH,
     block: int = BLOCK,
     verbose: bool = True,
+    cache_path: str | Path | None = None,
+    flush_every: int = 2048,
 ) -> np.ndarray:
     """Embed every tile window with UNI2-h.
 
     Reads the slide in ``block``-sized chunks and crops tiles out of each,
     so each region of the slide is decoded once rather than once per tile.
+
+    With ``cache_path`` the embeddings are checkpointed to disk every
+    ``flush_every`` tiles and reloaded on a re-run, so an interrupted section
+    resumes instead of restarting. This matters at scale: a 25 000-tile
+    section is over an hour, and a walltime kill would otherwise discard all
+    of it.
 
     Args:
         level0: an array-like supporting ``[y0:y1, x0:x1]`` on the level-0
@@ -467,6 +554,10 @@ def embed_tiles(
         batch: tiles per forward pass.
         block: slide read-block side, level-0 pixels.
         verbose: log throughput and ETA.
+        cache_path: ``.npz`` to checkpoint embeddings to and resume from. A
+            cache whose fingerprint does not match this tile set is ignored
+            and overwritten, never partially reused.
+        flush_every: checkpoint interval, in tiles.
 
     Returns:
         ``(len(tiles), 1536)`` float16 embeddings, row-aligned to ``tiles``.
@@ -474,47 +565,86 @@ def embed_tiles(
     import torch
     from PIL import Image
 
+    fov = int(round(fov_um / mpp))
+    h0, w0 = level0.shape[:2]
+
+    # Row position, not the DataFrame's index label -- tiles may be sliced
+    # (``--limit``) or filtered upstream, and emb is indexed positionally.
+    work = tiles.reset_index(drop=True)
+    fingerprint = tile_fingerprint(work, mpp, fov_um)
+
+    emb = np.zeros((len(work), _EMBED_DIM), np.float16)
+    computed = np.zeros(len(work), bool)
+
+    cache_path = Path(cache_path) if cache_path is not None else None
+    if cache_path is not None:
+        cached = load_embedding_cache(cache_path)
+        if cached is not None:
+            cached_emb, cached_done, cached_fp = cached
+            if cached_fp == fingerprint and cached_emb.shape == emb.shape:
+                emb, computed = cached_emb.copy(), cached_done.copy()
+                if verbose and computed.any():
+                    log(
+                        f"  resuming from {cache_path.name}: "
+                        f"{int(computed.sum()):,}/{len(work):,} tiles cached"
+                    )
+            elif verbose:
+                log(
+                    f"  [WARN] {cache_path.name} does not match this tile set "
+                    f"(different mpp, window or tile grid); recomputing."
+                )
+
+    if computed.all():
+        return emb
+
     if encoder is None:
         encoder = load_encoder(device)
     model, dev, dtype = encoder
 
-    fov = int(round(fov_um / mpp))
-    h0, w0 = level0.shape[:2]
-
-    emb = np.zeros((len(tiles), _EMBED_DIM), np.float16)
-    # Row position, not the DataFrame's index label -- tiles may be sliced
-    # (``--limit``) or filtered upstream, and emb is indexed positionally.
-    work = tiles.reset_index(drop=True)
     work = work.assign(_bx=work.x0_px // block, _by=work.y0_px // block)
 
     buf: list[np.ndarray] = []
     idxs: list[int] = []
-    done = 0
+    done = int(computed.sum())
+    start_done = done
+    since_flush = 0
     t0 = time.time()
 
-    def flush() -> None:
-        nonlocal buf, idxs, done
+    def run_batch() -> None:
+        nonlocal buf, idxs, done, since_flush
         if not buf:
             return
         x = torch.from_numpy(np.stack(buf)).to(dev, dtype)
         with torch.inference_mode():
             emb[idxs] = model(x).float().cpu().numpy().astype(np.float16)
+        computed[idxs] = True
         done += len(idxs)
+        since_flush += len(idxs)
         buf, idxs = [], []
+
+        if cache_path is not None and since_flush >= flush_every:
+            _write_embedding_cache(cache_path, emb, computed, fingerprint)
+            since_flush = 0
+
         if verbose:
             el = time.time() - t0
-            rate = done / max(el, 1e-9)
+            rate = (done - start_done) / max(el, 1e-9)
             log(
                 f"  {done:,}/{len(work):,}  {rate:.1f} tiles/s  "
                 f"eta {(len(work) - done) / max(rate, 1e-9) / 60:.1f} min"
             )
 
     for (by, bx), grp in work.groupby(["_by", "_bx"]):
+        rows = grp.index.to_numpy()
+        if computed[rows].all():
+            continue  # whole block already cached -- skip the slide read too
         yb, xb = by * block, bx * block
         blk = np.asarray(
             level0[yb : min(h0, yb + block + fov), xb : min(w0, xb + block + fov)]
         )
-        for i, r in zip(grp.index.to_numpy(), grp.itertuples()):
+        for i, r in zip(rows, grp.itertuples()):
+            if computed[i]:
+                continue
             c = blk[
                 int(r.y0_px) - yb : int(r.y0_px) - yb + fov,
                 int(r.x0_px) - xb : int(r.x0_px) - xb + fov,
@@ -529,8 +659,11 @@ def embed_tiles(
             buf.append(((im - MEAN) / STD).transpose(2, 0, 1))
             idxs.append(int(i))
             if len(buf) == batch:
-                flush()
-    flush()
+                run_batch()
+    run_batch()
+
+    if cache_path is not None:
+        _write_embedding_cache(cache_path, emb, computed, fingerprint)
 
     return emb
 
@@ -577,8 +710,10 @@ def predict_slide(
     quantile: float = 0.80,
     mask_level: int = 4,
     limit: int = 0,
+    stride: int = 1,
     device: str | None = None,
     encoder=None,
+    cache_path: str | Path | None = None,
     verbose: bool = True,
 ) -> tuple[pd.DataFrame, dict]:
     """Predict niches for one slide.
@@ -594,10 +729,15 @@ def predict_slide(
             bundle.
         quantile: per-slide quantile for ``call_*``.
         mask_level: pyramid level used for tissue detection.
-        limit: cap the number of tiles (debugging only; 0 = no cap).
+        limit: cap the number of tiles (debugging only; 0 = no cap). Takes the
+            FIRST n tiles in block order, so it samples one corner of the
+            section -- use ``stride`` for a representative preview.
+        stride: keep every ``stride``-th grid cell in each axis; a fast
+            full-extent preview at 1/stride^2 the cost.
         device: torch device override.
         encoder: preloaded encoder from :func:`load_encoder`, to amortise the
             ~2.5 GB model load across a whole section stack.
+        cache_path: ``.npz`` to checkpoint embeddings to and resume from.
         verbose: log progress.
 
     Returns:
@@ -651,15 +791,25 @@ def predict_slide(
             log(f"tissue: {100 * tissue.mean():.1f}% of frame at level {ml}")
 
         tiles = tile_grid(
-            (w0, h0), mpp, tissue, tile_um=model.tile_um, fov_um=model.fov_um
+            (w0, h0),
+            mpp,
+            tissue,
+            tile_um=model.tile_um,
+            fov_um=model.fov_um,
+            stride=stride,
         )
         if limit:
             tiles = tiles.iloc[:limit]
         if verbose:
             fov = int(round(model.fov_um / mpp))
+            spacing = (
+                ""
+                if stride == 1
+                else f" (stride {stride}: every {stride * model.tile_um:.0f}um)"
+            )
             log(
                 f"{len(tiles):,} tiles on a {model.tile_um:.0f}um grid, "
-                f"{fov}px ({model.fov_um:.0f}um) windows"
+                f"{fov}px ({model.fov_um:.0f}um) windows{spacing}"
             )
         if not len(tiles):
             raise ValueError(
@@ -674,6 +824,7 @@ def predict_slide(
             fov_um=model.fov_um,
             encoder=encoder,
             device=device,
+            cache_path=cache_path,
             verbose=verbose,
         )
 
@@ -693,6 +844,7 @@ def predict_slide(
         "tissue_frac": float(tissue.mean()),
         "mask_level": int(ml),
         "quantile": float(quantile),
+        "stride": int(stride),
     }
     return tiles, meta
 
@@ -828,6 +980,25 @@ def main(argv: list[str] | None = None) -> int:
         "--mask-level", type=int, default=4, help="pyramid level for tissue detection"
     )
     ap.add_argument("--limit", type=int, default=0, help="debug: cap number of tiles")
+    ap.add_argument(
+        "--stride",
+        type=int,
+        default=1,
+        help=(
+            "keep every Nth grid cell in each axis -- a full-extent preview at "
+            "1/N^2 the cost (e.g. --stride 4 is ~16x faster). Unlike --limit, "
+            "which samples one corner, this covers the whole section."
+        ),
+    )
+    ap.add_argument(
+        "--no-cache",
+        action="store_true",
+        help=(
+            "do not checkpoint embeddings to OUT/embeddings.npz. By default "
+            "they are saved every 2048 tiles, so an interrupted run resumes "
+            "and the classifier can be re-run without paying for UNI2-h again."
+        ),
+    )
     a = ap.parse_args(argv)
 
     out = Path(a.out)
@@ -852,6 +1023,8 @@ def main(argv: list[str] | None = None) -> int:
             quantile=a.quantile,
             mask_level=a.mask_level,
             limit=a.limit,
+            stride=a.stride,
+            cache_path=None if a.no_cache else out / "embeddings.npz",
         )
     except ValueError as exc:
         log(f"[ERROR] {exc}")

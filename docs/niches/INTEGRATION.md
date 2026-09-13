@@ -152,12 +152,46 @@ To reproduce the model card's reporting resolution exactly, rasterise with
 `grid_um=250.0` instead — that averages the tiles in each cell, which is the
 correct way to coarsen.
 
-## Cost
+## Cost, caching and previews
 
-~17 tiles/s on an M3 Max; a 60 mm² section is ~60 000 tiles ≈ 1 hour, **per
-section**. A 150-section stack is a multi-day GPU job. The encoder is loaded
-once and reused across the stack, and completed sections are skipped on re-run,
-but plan for HPC.
+The model card quotes ~17 tiles/s on an M3 Max. Measured on a real 25 mm²
+section here it was **~5 tiles/s**, so budget from your own throughput, not the
+quoted figure: 25 000 tiles took ~80 min for one section. A 150-section stack is
+a multi-day GPU job.
+
+The embedding pass is the *only* expensive part — the classifier on top runs in
+milliseconds. So embeddings are checkpointed to disk every 2048 tiles
+(`output_dir/embeddings/NNNN.npz`, ~75 MB per 25 000 tiles) and reloaded on a
+re-run. That buys two things:
+
+- **An interrupted section resumes** instead of restarting. Without it, a
+  walltime kill at tile 24 000 of 24 598 discards the whole section.
+- **Re-scoring is free.** Change `--quantile`, or swap in a retrained
+  classifier, without paying for UNI2-h again:
+
+  ```python
+  from path3d.niches import load_embedding_cache, load_model
+  from path3d.niches.predict import classify_embeddings
+
+  emb, done, _ = load_embedding_cache("out/embeddings.npz")
+  p, cols = classify_embeddings(emb[done], load_model(), quantile=0.9)
+  ```
+
+A cache is keyed by a fingerprint of the tile coordinates, `mpp` and window
+size. If any of those change it is discarded whole and recomputed — never
+partially reused, which would silently mix embeddings from two different tile
+sets. Pass `--no-cache` / `cache_embeddings=False` to disable.
+
+**For a quick look, use `--stride`.** It keeps every Nth grid cell in each axis,
+so `--stride 4` covers the whole section at 1/16 the cost. The kept tiles stay
+on their original grid positions, so a preview rasterises into exactly the same
+cells a full run would — just sparser, with the gaps left NaN. Prefer it over
+`--limit`, which takes the first N tiles in block order and therefore samples
+one corner of the section.
+
+```bash
+python -m path3d.niches.predict SECTION.ome.tiff --out preview --stride 4
+```
 
 ## Before you trust a batch
 

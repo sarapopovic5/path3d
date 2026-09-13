@@ -61,8 +61,10 @@ def predict_sections(
     quantile: float = 0.80,
     mask_level: int = 4,
     limit: int = 0,
+    stride: int = 1,
     device: str | None = None,
     skip_existing: bool = True,
+    cache_embeddings: bool = True,
     verbose: bool = True,
 ) -> dict[str, dict]:
     """Run the niche model over every registered section in a manifest.
@@ -83,8 +85,15 @@ def predict_sections(
         quantile: per-slide quantile for the ``call_*`` columns.
         mask_level: pyramid level for tissue detection.
         limit: cap tiles per section (debugging only).
+        stride: keep every ``stride``-th grid cell in each axis -- a fast
+            full-extent preview of the whole stack at 1/stride^2 the cost.
         device: torch device override.
         skip_existing: reuse a section's CSV if it is already on disk.
+        cache_embeddings: checkpoint each section's UNI2-h embeddings to
+            ``output_dir/embeddings/{idx:04d}.npz``. Costs ~75 MB per 25 000
+            tiles and makes an interrupted section resume mid-way rather than
+            restart; it also lets the classifier be re-run later without
+            paying for the encoder again.
         verbose: log progress.
 
     Returns:
@@ -95,6 +104,9 @@ def predict_sections(
     paths = load_manifest(manifest_csv)
     tiles_dir = Path(output_dir) / "tiles"
     tiles_dir.mkdir(parents=True, exist_ok=True)
+    embeddings_dir = Path(output_dir) / "embeddings"
+    if cache_embeddings:
+        embeddings_dir.mkdir(parents=True, exist_ok=True)
 
     if not isinstance(model, NicheModel):
         model = load_model(model)
@@ -135,7 +147,11 @@ def predict_sections(
                 quantile=quantile,
                 mask_level=mask_level,
                 limit=limit,
+                stride=stride,
                 encoder=encoder,
+                cache_path=(
+                    embeddings_dir / f"{index:04d}.npz" if cache_embeddings else None
+                ),
                 verbose=verbose,
             )
         except ValueError as exc:

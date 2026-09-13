@@ -43,10 +43,12 @@ from path3d.niches.predict import (
     classify_embeddings,
     embed_tiles,
     grid_shape,
+    load_embedding_cache,
     load_encoder,
     load_model,
     predict_slide,
     read_mpp,
+    tile_fingerprint,
     tile_grid,
     tissue_mask,
 )
@@ -68,6 +70,7 @@ __all__ = [
     "classify_embeddings",
     "embed_tiles",
     "grid_shape",
+    "load_embedding_cache",
     "load_encoder",
     "load_model",
     "load_sections",
@@ -80,6 +83,7 @@ __all__ = [
     "resolve_z_spacing",
     "run_niche_pipeline",
     "smooth_probs",
+    "tile_fingerprint",
     "tile_grid",
     "tissue_mask",
 ]
