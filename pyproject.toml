@@ -60,6 +60,18 @@ segmentation = ["spatialdata", "transformers>=4.35.0"]
 nuclear_detection = ["cellpose", "zarr>=2.16,<3"]
 training = ["segmentation-models-pytorch", "albumentations"]
 volume = ["spatialdata>=0.3.0,<0.4.0", "zarr>=2.16,<3", "pyarrow"]
+# Xenium tissue-neighbourhood prediction (path3d.niches). scikit-learn is
+# needed to unpickle the bundled LogisticRegression; timm/huggingface_hub pull
+# the gated MahmoodLab/UNI2-h encoder, which needs `hf auth login`.
+niches = [
+    "scikit-learn",
+    "joblib",
+    "timm",
+    "huggingface_hub",
+    "tifffile",
+    "zarr>=2.16,<3",
+    "spatialdata>=0.3.0,<0.4.0",
+]
 # napari 0.8.0+ and napari-spatialdata 0.7.0+ require Python >=3.11; 0.7.1 /
 # 0.6.0 are the last releases compatible with requires-python = ">=3.10".
 # napari does not bundle a Qt backend itself, hence the [pyqt5] extra marker.
@@ -82,6 +94,7 @@ all = [
     "path3d[training]",
     "path3d[volume]",
     "path3d[viz]",
+    "path3d[niches]",
 ]
 
 [project.urls]
@@ -91,3 +104,12 @@ Issues = "https://github.com/sarapopovic5/path3d/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/path3d"]
+# The niche classifier is the only non-code asset that must ship in the wheel;
+# path3d.niches.predict resolves it relative to its own __file__.
+artifacts = ["src/path3d/niches/models/*.joblib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs real data and/or the gated UNI2-h encoder",
+]

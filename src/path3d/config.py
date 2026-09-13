@@ -64,3 +64,49 @@ TISSUE_CLASS_COLORS = {
         dtype=np.uint8,
     )
 }
+
+
+# Xenium-derived tissue NEIGHBOURHOODS (path3d.niches) -- a different axis from
+# TISSUE_CLASSES above. TISSUE_CLASSES["HGSC"] is a per-pixel morphological
+# segmentation (is this pixel epithelium or stroma?); these are 50 um
+# neighbourhood classes predicted per 32 um tile (what kind of region is this?).
+# Both can be built for the same stack; they are not interchangeable.
+#
+# Registered as a TISSUE_CLASSES key so view_volume / compute_volumetrics /
+# _write_section_outputs work on a niche volume unchanged, via
+# tissue_type="HGSC_niches".
+#
+# Index 0 is background (no prediction: off-tissue, or inside the canvas margin
+# a 112 um window cannot fit in), matching Labels3DModel's and napari's
+# background convention.
+NICHE_BACKGROUND_INDEX = 0
+
+# Class NAME -> label index. Deliberately keyed by name, not by position in the
+# classifier's classes_ array: sklearn orders classes_ alphabetically
+# (acellular, epithelium, immune, stroma), so a positional convention would
+# silently reassign every index if the bundle were retrained with a different
+# class set. path3d.niches.rasterize.argmax_labels looks up by name.
+NICHE_LABEL_INDEX = {
+    "epithelium": 1,
+    "immune": 2,
+    "stroma": 3,
+    "acellular": 4,
+}
+
+TISSUE_CLASSES["HGSC_niches"] = {
+    NICHE_BACKGROUND_INDEX: "background",
+    **{index: name for name, index in NICHE_LABEL_INDEX.items()},
+}
+
+# Palette from the niche model card's own figures, so a 3D volume reads the
+# same way as the per-slide niche_maps.png QC figure.
+TISSUE_CLASS_COLORS["HGSC_niches"] = np.array(
+    [
+        [0, 0, 0],        # 0 background
+        [123, 63, 157],   # 1 epithelium  #7b3f9d
+        [201, 85, 63],    # 2 immune      #c9553f
+        [63, 127, 157],   # 3 stroma      #3f7f9d
+        [184, 176, 164],  # 4 acellular   #b8b0a4
+    ],
+    dtype=np.uint8,
+)

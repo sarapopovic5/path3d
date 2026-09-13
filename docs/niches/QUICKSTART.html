@@ -1,0 +1,280 @@
+<title>H&amp;E Niche Model Quickstart</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,400;6..72,500&family=Public+Sans:ital,wght@0,300;0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+:root{
+  --ink:#14201f; --ink-2:#3d5150; --mute:#6b7d7c; --faint:#95a3a2;
+  --paper:#f8faf9; --card:#ffffff; --rule:#dce5e3; --rule-2:#c3d0ce;
+  --teal:#1f6b63; --teal-soft:#e6f1ef; --amber:#9a6a12;
+  --epi:#7b3f9d; --imm:#c9553f; --str:#3f7f9d; --ace:#8d8578;
+  --code-bg:#10201f; --code-fg:#dfeae8;
+}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){
+    --ink:#e6efed; --ink-2:#b6c6c4; --mute:#8d9d9b; --faint:#71817f;
+    --paper:#101817; --card:#182322; --rule:#26332f; --rule-2:#35443f;
+    --teal:#6fc0b3; --teal-soft:#122724; --amber:#d9a85a;
+    --epi:#b58ad4; --imm:#e88a76; --str:#7fb4cf; --ace:#b5ab9c;
+    --code-bg:#0a1413; --code-fg:#cfdedc;
+  }
+}
+:root[data-theme="dark"]{
+  --ink:#e6efed; --ink-2:#b6c6c4; --mute:#8d9d9b; --faint:#71817f;
+  --paper:#101817; --card:#182322; --rule:#26332f; --rule-2:#35443f;
+  --teal:#6fc0b3; --teal-soft:#122724; --amber:#d9a85a;
+  --epi:#b58ad4; --imm:#e88a76; --str:#7fb4cf; --ace:#b5ab9c;
+  --code-bg:#0a1413; --code-fg:#cfdedc;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--paper);color:var(--ink);
+  font-family:"Public Sans",-apple-system,BlinkMacSystemFont,sans-serif;
+  font-size:16.5px;line-height:1.65;-webkit-font-smoothing:antialiased}
+.wrap{max-width:940px;margin:0 auto;padding:0 26px 90px}
+h1,h2,h3{font-family:Newsreader,Georgia,serif;font-weight:500;text-wrap:balance;margin:0}
+p{margin:0}
+code,kbd{font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.88em}
+a{color:var(--teal)}
+
+header{padding:64px 0 34px;border-bottom:1px solid var(--rule)}
+.eyebrow{font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.15em;
+  text-transform:uppercase;color:var(--teal);margin-bottom:18px}
+h1{font-size:clamp(2.1rem,4.6vw,3.1rem);line-height:1.08;letter-spacing:-.015em}
+.dek{margin-top:18px;font-size:1.15rem;color:var(--ink-2);max-width:60ch}
+.byline{margin-top:26px;font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--mute);
+  display:flex;gap:24px;flex-wrap:wrap}
+
+section{padding-top:52px}
+h2{font-size:1.5rem;letter-spacing:-.01em;margin-bottom:8px}
+.sub{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--faint);margin-bottom:22px}
+section>p{color:var(--ink-2);max-width:66ch}
+section>p+p{margin-top:14px}
+strong{color:var(--ink);font-weight:600}
+
+.classes{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;
+  margin:26px 0 0}
+.cl{background:var(--card);border:1px solid var(--rule);border-radius:3px;padding:16px 18px}
+.sw{width:26px;height:6px;border-radius:2px;display:block;margin-bottom:11px}
+.cl b{display:block;font-size:1rem;margin-bottom:2px}
+.cl span{font-size:13.5px;color:var(--mute);display:block}
+.cl .auc{font-family:"IBM Plex Mono",monospace;font-size:13px;color:var(--ink);margin-top:9px;
+  display:block;font-variant-numeric:tabular-nums}
+
+.scroll{overflow-x:auto;margin-top:24px}
+table{width:100%;border-collapse:collapse;font-size:14.5px;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:10px 14px;border-bottom:1px solid var(--rule)}
+th:first-child,td:first-child{text-align:left}
+thead th{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.09em;
+  text-transform:uppercase;color:var(--faint);border-bottom:1px solid var(--rule-2)}
+td.good{color:var(--teal);font-weight:600}
+td.warn{color:var(--amber)}
+
+pre{background:var(--code-bg);color:var(--code-fg);padding:16px 18px;border-radius:3px;
+  overflow-x:auto;margin:18px 0 0;font-size:13.5px;line-height:1.6}
+pre code{color:inherit}
+
+.steps{counter-reset:s;margin-top:26px;display:grid;gap:1px;background:var(--rule);
+  border:1px solid var(--rule)}
+.step{background:var(--card);padding:20px 22px;display:grid;
+  grid-template-columns:34px 1fr;gap:16px;align-items:start}
+.step::before{counter-increment:s;content:counter(s);font-family:"IBM Plex Mono",monospace;
+  font-size:12px;color:var(--teal);border:1px solid var(--rule-2);border-radius:50%;
+  width:26px;height:26px;display:grid;place-items:center;margin-top:2px}
+.step h3{font-size:1.05rem;font-family:"Public Sans",sans-serif;font-weight:600;
+  margin-bottom:5px}
+.step p{font-size:15px;color:var(--ink-2)}
+.step pre{margin-top:12px}
+
+.flag{border-left:3px solid var(--amber);background:var(--card);border-top:1px solid var(--rule);
+  border-right:1px solid var(--rule);border-bottom:1px solid var(--rule);
+  padding:18px 22px;margin-top:24px;border-radius:0 3px 3px 0}
+.flag b{color:var(--amber)}
+.flag p{font-size:15.5px;color:var(--ink-2)}
+.flag p+p{margin-top:10px}
+
+ul{margin:16px 0 0;padding-left:20px;color:var(--ink-2);max-width:66ch}
+li{margin-bottom:9px}
+li b{color:var(--ink)}
+dl{margin:22px 0 0;display:grid;grid-template-columns:auto 1fr;gap:10px 20px;
+  font-size:15px;align-items:baseline}
+dt{font-family:"IBM Plex Mono",monospace;font-size:12.5px;color:var(--ink);white-space:nowrap}
+dd{margin:0;color:var(--ink-2)}
+footer{margin-top:72px;padding-top:26px;border-top:1px solid var(--rule);
+  font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--faint);line-height:1.9}
+:focus-visible{outline:2px solid var(--teal);outline-offset:3px}
+@media (max-width:620px){
+  dl{grid-template-columns:1fr;gap:3px 0} dt{margin-top:10px}
+  .step{grid-template-columns:1fr} .step::before{display:none}
+}
+</style>
+
+<div class="wrap">
+<header>
+  <div class="eyebrow">Cook Lab &middot; model hand-off</div>
+  <h1>Tissue neighbourhoods from an H&amp;E slide</h1>
+  <p class="dek">Give it a whole-slide H&amp;E image; it returns a four-class tissue map &mdash;
+  epithelium, immune, stroma, acellular &mdash; learned from Xenium spatial transcriptomics.
+  No spatial data needed to run it.</p>
+  <div class="byline">
+    <span>predict_niches.py &middot; 4 files, 70 KB</span>
+    <span>trained on 8 HGSC whole tumours</span>
+    <span>snersesian@ohri.ca</span>
+  </div>
+</header>
+
+<section>
+  <h2>What you get</h2>
+  <div class="sub">four classes, with their measured accuracy</div>
+  <p>Each class comes from Xenium-derived 50&nbsp;&micro;m neighbourhoods. AUC is measured
+  leave-one-tumour-out &mdash; every score is from a model that had never seen that tumour.</p>
+  <div class="classes">
+    <div class="cl"><span class="sw" style="background:var(--epi)"></span>
+      <b>epithelium</b><span>secretory tumour epithelium, all secretory niches merged</span>
+      <span class="auc">AUC 0.911 &middot; worst 0.845</span></div>
+    <div class="cl"><span class="sw" style="background:var(--imm)"></span>
+      <b>immune</b><span>immune-rich neighbourhood</span>
+      <span class="auc">AUC 0.923 &middot; worst 0.804</span></div>
+    <div class="cl"><span class="sw" style="background:var(--str)"></span>
+      <b>stroma</b><span>fibroblast, vascular, mesothelial</span>
+      <span class="auc">AUC 0.869 &middot; worst 0.626</span></div>
+    <div class="cl"><span class="sw" style="background:var(--ace)"></span>
+      <b>acellular</b><span>necrosis, dense ECM, mucin</span>
+      <span class="auc">AUC 0.866 &middot; worst 0.814</span></div>
+  </div>
+  <p style="margin-top:26px"><strong>Epithelium and immune are the dependable classes.</strong>
+  Stroma is strong on average but falls to 0.626 on one unusual tumour, and 17% of true stroma gets
+  labelled immune &mdash; both are non-epithelial cellular tissue, so they are genuinely similar
+  under the microscope. Treat stroma and acellular as regional tendencies rather than firm calls.</p>
+</section>
+
+<section>
+  <h2>Why the epithelial niches are merged into one</h2>
+  <div class="sub">a deliberate result, not a shortcut</div>
+  <p>The individual secretory niches encode a polarisation axis (SecA &rarr; transitioning &rarr;
+  SecB) that matters clinically. We tried hard to read that axis from morphology and it is
+  <strong>not recoverable</strong>: per-class F1 landed at 0.03&ndash;0.17 and did not budge when we
+  gave it fourteen times more data. A separate continuous SecB model reached only AUC
+  0.65&ndash;0.78, with no way to tell in advance which tumours it would handle.</p>
+  <p>Merged into a single epithelium class, the compartment is read reliably at AUC 0.911. That
+  trade is the whole point of this model &mdash; it gives you the part that holds up.</p>
+</section>
+
+<section>
+  <h2>Setup</h2>
+  <div class="sub">about fifteen minutes, once</div>
+  <div class="steps">
+    <div class="step">
+      <div>
+        <h3>Get access to the feature extractor</h3>
+        <p>The model sits on top of UNI2-h, a pathology vision model that is access-gated. Request
+        it at <a href="https://huggingface.co/MahmoodLab/UNI2-h">huggingface.co/MahmoodLab/UNI2-h</a>
+        using your institutional email &mdash; approval is manual but not slow.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div>
+        <h3>Install the dependencies</h3>
+<pre><code>pip install "timm&gt;=0.9.8" huggingface_hub torch tifffile zarr \
+            scikit-image scipy joblib pillow matplotlib</code></pre>
+      </div>
+    </div>
+    <div class="step">
+      <div>
+        <h3>Log in and cache the weights</h3>
+        <p>Paste a read token from your Hugging Face settings. Note the command name &mdash; recent
+        versions renamed it, so <code>huggingface-cli login</code> will not work.</p>
+<pre><code>hf auth login</code></pre>
+        <p style="margin-top:10px">The first run downloads about 2.5&nbsp;GB and caches it.</p>
+      </div>
+    </div>
+    <div class="step">
+      <div>
+        <h3>Run one slide and look at it</h3>
+<pre><code>python predict_niches.py SLIDE.ome.tif --mpp 0.2201 --out results_slide1</code></pre>
+        <p style="margin-top:10px">Open <code>results_slide1/niche_maps.png</code> before running a
+        batch. Roughly an hour for a 60&nbsp;mm&sup2; section (~17 tiles/sec on an Apple M3 Max,
+        faster on a CUDA GPU).</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="flag">
+    <p><b>Set <code>--mpp</code> to your own scanner's value.</b> It is the microns-per-pixel of
+    your level-0 image, and there is no default on purpose.</p>
+    <p>The model reasons in microns &mdash; a 32&nbsp;&micro;m grid with 112&nbsp;&micro;m windows.
+    If the value is wrong, every tile is physically the wrong size and results quietly degrade with
+    no error. Read it from your slide metadata. Ours was 0.2201; yours may differ.</p>
+  </div>
+</section>
+
+<section>
+  <h2>What it writes</h2>
+  <div class="sub">four files per slide</div>
+  <dl>
+    <dt>tiles_niches.csv</dt>
+    <dd>One row per 32&nbsp;&micro;m tile: position, a probability per class
+      (<code>p_epithelium</code> &hellip;), the most likely class, and per-class calls.</dd>
+    <dt>niche_maps_250um.npz</dt>
+    <dd>A 250&nbsp;&micro;m probability grid per class, plus tile counts. <code>NaN</code> off
+      tissue. This is the one to use for analysis.</dd>
+    <dt>niche_maps.png</dt>
+    <dd>H&amp;E, a most-likely-niche map, and one probability map per class. Your first check on
+      every slide.</dd>
+    <dt>summary.json</dt>
+    <dd>Tile count, tissue area, and the class mix the model saw.</dd>
+  </dl>
+</section>
+
+<section>
+  <h2>Two things about interpreting it</h2>
+  <div class="sub">both matter more than they sound</div>
+  <p><strong>Use the probabilities, and set thresholds per slide.</strong> Across our eight tumours
+  epithelium content ranged from 4.5% to 98.4%. On the 4.5% tumour the model ranked tiles correctly
+  (AUC 0.935) but a fixed cutoff gave a precision of 0.23 &mdash; not because the model was wrong,
+  but because any fixed threshold fails on a rare class. The script already writes per-slide
+  top-quantile calls (<code>call_*</code>); prefer the continuous <code>p_*</code> columns wherever
+  your analysis allows.</p>
+  <p><strong>Work at 250&nbsp;&micro;m, not per tile.</strong> We swept this properly: finer is
+  noisy, coarser smooths real structure away. Per-tile agreement with truth was substantially worse
+  than per-region agreement.</p>
+</section>
+
+<section>
+  <h2>For stacking serial sections</h2>
+  <div class="sub">what the model does not do for you</div>
+  <p>Tile coordinates are in each slide's own pixel space, so <strong>consecutive sections are not
+  aligned to one another</strong> &mdash; you will need to register them yourself. The
+  250&nbsp;&micro;m grids are reasonable registration targets, being smooth and tissue-shaped.</p>
+  <p>One suggestion worth the effort: check a single section per tissue block against something
+  orthogonal &mdash; even a pathologist's eye on the overlay. Reliability is a property of the
+  tumour, and all sections from one block share that tumour, so one check tells you about the whole
+  stack.</p>
+</section>
+
+<section>
+  <h2>Limits, stated plainly</h2>
+  <div class="sub">please read before publishing anything from it</div>
+  <ul>
+    <li><b>HGSC only</b>, post-Xenium H&amp;E, a single scanner at 0.2201&nbsp;&micro;m/px. Other
+      tumour types, stains or scanners are extrapolation. Stain normalisation is applied
+      automatically and helps, but is not a guarantee.</li>
+    <li><b>Tissue is found from the image alone</b> &mdash; dark <em>and</em> saturated pixels, with
+      small fragments dropped. Verified to keep stained tissue and reject grey ink marks and pale
+      background. Not tested against pen marks, large bubbles, or heavy artefact.</li>
+    <li><b>This is a compartment map, not a cell-state map.</b> It will not tell you about SecB.</li>
+    <li><b>No per-slide reliability score.</b> All eight tumours reached epithelium AUC &ge; 0.845,
+      so the risk is low, but a new slide cannot be certified in advance.</li>
+    <li><b>Not yet run on a slide from another scanner.</b> The full pipeline was tested end to end
+      on a synthetic slide, and the image-reading code is unchanged from the version that processed
+      260,000 real tiles &mdash; but you will be the first to run it on your material. Start with
+      one slide.</li>
+  </ul>
+</section>
+
+<footer>
+  Labels from Xenium 50&nbsp;&micro;m neighbourhoods &middot; features from MahmoodLab/UNI2-h
+  (frozen) &middot; validated leave-one-tumour-out on 8 HGSC whole tumours<br>
+  Questions, or if a slide looks wrong: snersesian@ohri.ca
+</footer>
+</div>

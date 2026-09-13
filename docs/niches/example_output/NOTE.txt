@@ -1,0 +1,8 @@
+These files were produced by running predict_niches.py on a SYNTHETIC test slide (random
+H&E-like texture), purely to show the output format and to verify the pipeline runs end to end.
+
+The predictions are meaningless — the synthetic slide has no real nuclei, so everything is
+classified "acellular", which is the correct response to featureless texture.
+
+Use them to check your own output looks structurally the same (same files, same columns),
+not as a reference for what real predictions look like.

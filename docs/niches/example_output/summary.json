@@ -1,0 +1,19 @@
+{
+  "slide": "synthetic_slide.ome.tif",
+  "mpp": 0.2201,
+  "n_tiles": 240,
+  "tissue_mm2": 0.24576,
+  "blocks_250um": 9,
+  "mean_prob": {
+    "acellular": 0.7914453536345055,
+    "epithelium": 0.05512950254691318,
+    "immune": 0.01797788348392293,
+    "stroma": 0.1354472603346585
+  },
+  "argmax_share": {
+    "acellular": 1.0,
+    "epithelium": 0.0,
+    "immune": 0.0,
+    "stroma": 0.0
+  }
+}
