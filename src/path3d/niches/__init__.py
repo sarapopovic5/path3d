@@ -52,6 +52,13 @@ from path3d.niches.predict import (
     tile_grid,
     tissue_mask,
 )
+from path3d.niches.quantify import (
+    add_probability_labels,
+    per_section_profile,
+    probability_mask,
+    soft_volumetrics,
+    voxel_um_zyx,
+)
 from path3d.niches.rasterize import (
     NicheSection,
     argmax_labels,
@@ -64,6 +71,7 @@ from path3d.niches.volume import build_niche_volume, resolve_z_spacing
 __all__ = [
     "NicheModel",
     "NicheSection",
+    "add_probability_labels",
     "argmax_labels",
     "build_niche_volume",
     "canvas_wh",
@@ -74,8 +82,10 @@ __all__ = [
     "load_encoder",
     "load_model",
     "load_sections",
+    "per_section_profile",
     "predict_sections",
     "predict_slide",
+    "probability_mask",
     "rasterize_csv",
     "rasterize_tiles",
     "read_mpp",
@@ -83,7 +93,9 @@ __all__ = [
     "resolve_z_spacing",
     "run_niche_pipeline",
     "smooth_probs",
+    "soft_volumetrics",
     "tile_fingerprint",
     "tile_grid",
     "tissue_mask",
+    "voxel_um_zyx",
 ]
