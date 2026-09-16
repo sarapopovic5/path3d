@@ -32,7 +32,6 @@ classifiers = [
 dependencies = [
     "numpy>=1.24,<2.0",   # valis-wsi requires numpy<2; xarray-dataclass>=3 requires numpy>=2
     "openslide-python",
-    "openslide-bin",      # bundles libopenslide as a pip wheel — no system install needed
     "scikit-image>=0.20", # regionprops_table(..., spacing=...) added in 0.20.0
     "scipy",
     "torchstain",
@@ -52,7 +51,21 @@ czi = ["aicspylibczi"]
 registration = [
     "valis-wsi",
     "opencv-contrib-python-headless<4.12.0", # 4.12 is last release supporting numpy<2
-    "pyvips-binary",                          # bundles libvips as a pip wheel
+]
+# Native libraries bundled as pip wheels, so a desktop install needs no system
+# package manager. Deliberately NOT a hard dependency: these publish wheels only
+# for mainstream platforms, and on anything else pip falls back to compiling
+# OpenSlide or libvips from source, which fails. That made the package
+# uninstallable on HPC systems whose platform tag has no wheel, such as the
+# Digital Research Alliance of Canada clusters (gentoo2023 x86-64-v4).
+#
+# Install these when you want a self-contained environment:
+#     pip install "path3d[binaries]"
+# Skip them where the native libraries already come from the system or from
+# environment modules, and pair that with `module load` on a cluster.
+binaries = [
+    "openslide-bin",  # bundles libopenslide
+    "pyvips-binary",  # bundles libvips
 ]
 deeperhistreg = ["deeperhistreg", "SimpleITK", "Pillow"]
 zeroreg3d = ["opencv-python"]
@@ -76,6 +89,7 @@ dev = ["pytest", "ruff", "matplotlib"]
 all = [
     "path3d[czi]",
     "path3d[registration]",
+    "path3d[binaries]",
     "path3d[deeperhistreg]",
     "path3d[segmentation]",
     "path3d[nuclear_detection]",
