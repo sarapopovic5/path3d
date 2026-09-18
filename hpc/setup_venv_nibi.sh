@@ -66,9 +66,31 @@ pip install --no-index --upgrade pip setuptools wheel
 #
 # --no-index is likewise wrong, however tempting: torchstain is not in the
 # wheelhouse at all, and valis-wsi needs a fastcluster that is not installable
-# from it either. Both build fine from PyPI source under gcc/12.3, which is how
-# they appear unsuffixed in the pycoda freeze.
-pip install -e "$REPO[$EXTRAS]"
+# from it either. Both come from PyPI, which is how they appear unsuffixed in
+# the pycoda freeze.
+#
+# fastcluster goes in first and alone, because it is the one dependency with no
+# usable wheel anywhere: PyPI ships manylinux (see below) or an sdist, and the
+# wheelhouse has nothing pip will take. Its sdist needs numpy at build time,
+# which the scipy-stack module already provides — so skip build isolation
+# rather than let pip try to build its own numpy from source too.
+pip install --no-build-isolation fastcluster
+
+# --only-binary=:all: is the crux of this whole file.
+#
+# This python does not accept manylinux wheels. Every compiled package on PyPI
+# therefore resolves to an sdist, and PyPI is ahead of the wheelhouse on most
+# versions — so pip prefers PyPI's pyogrio 0.13.0 sdist over the wheelhouse's
+# perfectly good pyogrio 0.10.0 wheel, tries to build it, and dies looking for
+# gdal-config. The same mechanism is behind tokenizers demanding Rust and
+# pandas 2.3.3 reporting "no matching distribution".
+#
+# Refusing sdists makes pip skip the candidates it cannot use and fall back to
+# the wheelhouse build, and converts any genuine gap into an instant, named
+# error instead of a compile that fails twenty minutes in. The two exceptions
+# are named explicitly: fastcluster above, and path3d itself, which is a local
+# editable install and has to be built.
+pip install --only-binary=:all: --no-binary=path3d,fastcluster -e "$REPO[$EXTRAS]"
 
 # ------------------------------------------------------------- 4. verify
 # A clean `pip install` proves nothing: the compiled extensions (pyvips,
