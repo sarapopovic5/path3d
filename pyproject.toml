@@ -72,14 +72,22 @@ zeroreg3d = ["opencv-python"]
 segmentation = ["spatialdata", "transformers>=4.35.0"]
 nuclear_detection = ["cellpose", "zarr>=2.16,<3"]
 training = ["segmentation-models-pytorch", "albumentations"]
-volume = ["spatialdata>=0.3.0,<0.4.0", "zarr>=2.16,<3", "pyarrow"]
+# The spatialdata ceiling is a major-version guard, not a known incompatibility:
+# 0.4.0 changed no API path3d touches. Keep it in step with [viz] below — 0.4.0
+# writes a newer NGFF version string into image/label .zattrs, and a store
+# written by 0.4.0 will not open in 0.3.x. (The reverse is fine, so volumes
+# already on disk need no migration.)
+volume = ["spatialdata>=0.3.0,<0.5.0", "zarr>=2.16,<3", "pyarrow"]
 # napari 0.8.0+ and napari-spatialdata 0.7.0+ require Python >=3.11; 0.7.1 /
 # 0.6.0 are the last releases compatible with requires-python = ">=3.10".
 # napari does not bundle a Qt backend itself, hence the [pyqt5] extra marker.
+# napari-spatialdata 0.6.0 itself only asks for spatialdata>=0.2.6, so this
+# ceiling is ours. It must match [volume]'s, or a volume written by one half of
+# the project fails to open in the other.
 viz = [
     "napari[pyqt5]==0.7.1",
     "napari-spatialdata==0.6.0",
-    "spatialdata>=0.3.0,<0.4.0",
+    "spatialdata>=0.3.0,<0.5.0",
 ]
 dev = ["pytest", "ruff", "matplotlib"]
 # Everything except [zeroreg3d]: its opencv-python and the

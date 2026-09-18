@@ -18,6 +18,9 @@ module load cuda/12.2
 module load python/3.10
 module load opencv/4.10.0
 module load java/11.0.22
+# pyarrow ([volume]) is not a real wheel here: the wheelhouse lists it at the
+# sentinel version 9999, meaning "provided by a module, do not pip install".
+module load arrow
 
 # VALIS shells out to Bio-Formats through scyjava/jgo, which reads JAVA_HOME.
 # The java module sets it; assert rather than discover a silent failure later.
