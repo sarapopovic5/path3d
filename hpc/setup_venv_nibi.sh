@@ -23,8 +23,14 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 #   viz           napari + PyQt5: a long build for a GUI with no display here.
 #   zeroreg3d     its opencv-python collides with [registration]'s headless cv2.
 #   deeperhistreg not in the wheelhouse, and registration runs through VALIS.
+#   segmentation  costs nothing to omit: its spatialdata also comes from
+#                 [volume], and its transformers is imported nowhere in path3d.
+#                 Including it breaks the install — transformers needs
+#                 tokenizers>=0.23.1, the wheelhouse has no such wheel, and the
+#                 PyPI sdist wants a Rust toolchain to build. If transformers is
+#                 ever genuinely needed here, `module load rust` first.
 # Add `niches` here once that branch lands on main.
-EXTRAS="czi,registration,segmentation,nuclear_detection,training,volume,dev"
+EXTRAS="czi,registration,nuclear_detection,training,volume,dev"
 
 # ---------------------------------------------------------------- 1. modules
 # shellcheck source=modules-nibi.sh
