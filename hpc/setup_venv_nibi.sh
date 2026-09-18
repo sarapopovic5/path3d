@@ -35,7 +35,8 @@ echo "python: $(command -v python)  ($(python -V 2>&1))"
 # Built against the module python, without system site-packages. cv2 still
 # resolves: the opencv module puts it on PYTHONPATH, not in site-packages.
 if [[ -d "$VENV" ]]; then
-    echo "!! $VENV already exists. Remove it, or set VENV=..." >&2
+    echo "!! $VENV already exists — including after a failed run, which leaves a" >&2
+    echo "   half-built venv behind. Start clean:  rm -rf $VENV" >&2
     exit 1
 fi
 python -m venv "$VENV"
@@ -43,11 +44,15 @@ source "$VENV/bin/activate"
 pip install --no-index --upgrade pip setuptools wheel
 
 # ------------------------------------------------------------- 3. install
-# Plain `pip install` on a login node prefers the CVMFS wheelhouse and falls
-# back to PyPI — which is how the pycoda freeze ended up a mix of
-# `+computecanada` and bare PyPI versions. constraints-nibi.txt pins that mix,
-# so shared dependencies land on versions already proven to work here.
-pip install -e "$REPO[$EXTRAS]" -c "$REPO/hpc/constraints-nibi.txt"
+# Versions are deliberately left to pip. The CVMFS wheelhouse is on find-links,
+# so compiled packages come from there, and pure-Python ones pip fetches from
+# PyPI. Pinning on top of that does not work: a freeze taken on one wheelhouse
+# snapshot names compiled versions a later snapshot no longer serves (Nibi
+# currently has pandas 2.2.1, not the 2.3.3 a sibling project froze), and PyPI
+# cannot fill the gap for anything needing a compiled wheel. The constraints
+# that actually matter — numpy<2, spatialdata<0.4, zarr<3, opencv<4.12 — are in
+# pyproject.toml, where they are checked on every platform rather than one.
+pip install -e "$REPO[$EXTRAS]"
 
 # ------------------------------------------------------------- 4. verify
 # A clean `pip install` proves nothing: the compiled extensions (pyvips,
