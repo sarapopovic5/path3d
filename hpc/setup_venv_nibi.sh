@@ -56,8 +56,18 @@ pip install --no-index --upgrade pip setuptools wheel
 # snapshot names compiled versions a later snapshot no longer serves (Nibi
 # currently has pandas 2.2.1, not the 2.3.3 a sibling project froze), and PyPI
 # cannot fill the gap for anything needing a compiled wheel. The constraints
-# that actually matter — numpy<2, spatialdata<0.4, zarr<3, opencv<4.12 — are in
+# that actually matter — numpy<2, spatialdata<0.5, zarr<3, opencv<4.12 — are in
 # pyproject.toml, where they are checked on every platform rather than one.
+#
+# Never add -c here. The cluster already sets PIP_CONSTRAINT to its own
+# constraints file, and -c on the command line REPLACES that rather than adding
+# to it — so a local constraints file silently switches off the pins that keep
+# the wheelhouse self-consistent.
+#
+# --no-index is likewise wrong, however tempting: torchstain is not in the
+# wheelhouse at all, and valis-wsi needs a fastcluster that is not installable
+# from it either. Both build fine from PyPI source under gcc/12.3, which is how
+# they appear unsuffixed in the pycoda freeze.
 pip install -e "$REPO[$EXTRAS]"
 
 # ------------------------------------------------------------- 4. verify
