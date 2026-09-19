@@ -127,12 +127,10 @@ opencv-python-headless==4.11.0.86
 openpyxl==3.1.5
 openslide-bin==4.0.1.2
 openslide-python==1.4.6
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1777103621/work
 pandas==2.3.3
 param==2.4.2
 parso==0.8.7
 partd==1.4.2
--e git+ssh://git@github.com/sarapopovic5/path3d.git@3f7f53e465897391351f8df6520f17a8be0b36ad#egg=path3d
 patsy==1.0.3
 pexpect==4.9.0
 pillow==12.3.0
