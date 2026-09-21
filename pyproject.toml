@@ -29,29 +29,50 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 
+# Everything the pipeline needs end to end. `pip install path3d` gives you a
+# working install: slide I/O, registration, segmentation, nuclear detection and
+# volume assembly. The only things left optional are the bundled native
+# libraries and the GUI stack, both below, because each breaks an install
+# target the other one needs.
 dependencies = [
     "numpy>=1.24,<2.0",   # valis-wsi requires numpy<2; xarray-dataclass>=3 requires numpy>=2
-    "openslide-python",
-    "scikit-image>=0.20", # regionprops_table(..., spacing=...) added in 0.20.0
     "scipy",
-    "torchstain",
+    "pandas",
+    "scikit-image>=0.20", # regionprops_table(..., spacing=...) added in 0.20.0
+    "Pillow",
+    "tqdm",
+    # slide I/O. openslide-python and pyvips are bindings only -- they need
+    # libopenslide and libvips from the system, from environment modules, or
+    # from the [binaries] extra below.
+    "openslide-python",
+    "pyvips",
+    "aicspylibczi",
+    # registration. VALIS is the project's only registration method, and it is
+    # what pins numpy<2 above. Do not add anything here that pulls in a second
+    # `cv2` distribution (plain opencv-python, for instance) -- it conflicts
+    # with this headless contrib build, which is the superset minus the GUI
+    # windows the pipeline never opens.
+    "valis-wsi",
+    "opencv-contrib-python-headless<4.12.0", # 4.12 is last release supporting numpy<2
+    # segmentation and nuclear detection
     "torch",
     "torchvision",
-    "pandas",
-    "tqdm",
+    "torchstain",
     "timm",
     "huggingface_hub",
-    "tifffile",
-    "Pillow",
     "cellpose",
+    # volume assembly. The spatialdata ceiling is a major-version guard, not a
+    # known incompatibility: 0.4.0 changed no API path3d touches. Keep it in
+    # step with [viz] below -- 0.4.0 writes a newer NGFF version string into
+    # image/label .zattrs, and a store written by 0.4.0 will not open in 0.3.x.
+    # (The reverse is fine, so volumes already on disk need no migration.)
+    "spatialdata>=0.3.0,<0.5.0",
+    "anndata",
+    "zarr>=2.16,<3",
+    "pyarrow",
 ]
 
 [project.optional-dependencies]
-czi = ["aicspylibczi"]
-registration = [
-    "valis-wsi",
-    "opencv-contrib-python-headless<4.12.0", # 4.12 is last release supporting numpy<2
-]
 # Native libraries bundled as pip wheels, so a desktop install needs no system
 # package manager. Deliberately NOT a hard dependency: these publish wheels only
 # for mainstream platforms, and on anything else pip falls back to compiling
@@ -67,42 +88,26 @@ binaries = [
     "openslide-bin",  # bundles libopenslide
     "pyvips-binary",  # bundles libvips
 ]
-deeperhistreg = ["deeperhistreg", "SimpleITK", "Pillow"]
-zeroreg3d = ["opencv-python"]
-segmentation = ["spatialdata", "transformers>=4.35.0"]
-nuclear_detection = ["cellpose", "zarr>=2.16,<3"]
-training = ["segmentation-models-pytorch", "albumentations"]
-# The spatialdata ceiling is a major-version guard, not a known incompatibility:
-# 0.4.0 changed no API path3d touches. Keep it in step with [viz] below — 0.4.0
-# writes a newer NGFF version string into image/label .zattrs, and a store
-# written by 0.4.0 will not open in 0.3.x. (The reverse is fine, so volumes
-# already on disk need no migration.)
-volume = ["spatialdata>=0.3.0,<0.5.0", "zarr>=2.16,<3", "pyarrow"]
+# Interactive viewing. Optional because napari[pyqt5] pulls in PyQt5 and the
+# whole Qt5 runtime, which is dead weight on a headless compute node.
+#
 # napari 0.8.0+ and napari-spatialdata 0.7.0+ require Python >=3.11; 0.7.1 /
 # 0.6.0 are the last releases compatible with requires-python = ">=3.10".
 # napari does not bundle a Qt backend itself, hence the [pyqt5] extra marker.
-# napari-spatialdata 0.6.0 itself only asks for spatialdata>=0.2.6, so this
-# ceiling is ours. It must match [volume]'s, or a volume written by one half of
-# the project fails to open in the other.
+# napari-spatialdata 0.6.0 itself only asks for spatialdata>=0.2.6, so the
+# ceiling below is ours. It must match the core spatialdata pin, or a volume
+# written by one half of the project fails to open in the other.
 viz = [
     "napari[pyqt5]==0.7.1",
     "napari-spatialdata==0.6.0",
     "spatialdata>=0.3.0,<0.5.0",
 ]
 dev = ["pytest", "ruff", "matplotlib"]
-# Everything except [zeroreg3d]: its opencv-python and the
-# opencv-contrib-python-headless in [registration] both install a `cv2`
-# module, so the two cannot coexist. The headless contrib build is the
-# superset (minus GUI windows, which the pipeline never opens), so it wins.
+# Kept so existing `pip install "path3d[all]"` commands keep working. Note that
+# it includes [binaries], which is exactly what fails on a cluster -- there,
+# install the bare package after `module load` instead.
 all = [
-    "path3d[czi]",
-    "path3d[registration]",
     "path3d[binaries]",
-    "path3d[deeperhistreg]",
-    "path3d[segmentation]",
-    "path3d[nuclear_detection]",
-    "path3d[training]",
-    "path3d[volume]",
     "path3d[viz]",
 ]
 

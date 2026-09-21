@@ -40,7 +40,6 @@ dask-image==2026.5.0
 datashader==0.19.1
 debugpy==1.8.21
 decorator==5.3.1
-deeperhistreg==1.0.1
 docstring_parser==0.18.0
 einops==0.8.2
 et_xmlfile==2.0.0
