@@ -93,6 +93,15 @@ From: ubuntu:22.04
     python -m pip install --no-cache-dir --no-deps --force-reinstall \
         -c /opt/path3d/constraints.txt opencv-contrib-python-headless
 
+    # Importing valis instantiates its deep feature detectors, which fetch
+    # weights through torch.hub (DISK, LightGlue). A running image cannot
+    # write them into its read-only filesystem, so fetch them now, into the
+    # TORCH_HOME that %environment points at. Once present, torch.hub only
+    # reads them. The numba cache is redirected so no CPU-specific build
+    # artefacts land in the image.
+    export TORCH_HOME=/opt/torch
+    NUMBA_CACHE_DIR=/tmp/numba python -c "import valis.registration"
+
     # Record the resolved set. `apptainer exec path3d.sif cat /opt/path3d/pip-freeze.txt`
     python -m pip freeze > /opt/path3d/pip-freeze.txt
 
@@ -102,6 +111,14 @@ From: ubuntu:22.04
     export PYTHONUNBUFFERED=1
     # Nothing from a host ~/.local should shadow the image's packages.
     export PYTHONNOUSERSITE=1
+    # valis's torch.hub weights, fetched at build time (see %post).
+    export TORCH_HOME=/opt/torch
+    # datashader (via spatialdata) compiles numba functions with cache=True
+    # at import, and numba refuses to import if it has nowhere writable to
+    # cache them. site-packages is read-only here, and so is $HOME during
+    # `apptainer test`. /tmp is always writable, and under -W it sits on the
+    # job's local disk.
+    export NUMBA_CACHE_DIR="${NUMBA_CACHE_DIR:-/tmp/numba}"
     # Size the thread pools to the CPUs this process may use. Under -C the
     # host environment (SLURM_CPUS_PER_TASK included) is not passed in, but
     # nproc honours the job's cpuset. Pass --env OMP_NUM_THREADS=... to override.
