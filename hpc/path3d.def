@@ -1,0 +1,148 @@
+Bootstrap: docker
+From: ubuntu:22.04
+
+# path3d container for the cluster: preprocessing, VALIS registration,
+# UNI2-h segmentation and Cellpose-SAM nuclear detection. No napari/Qt;
+# visualization runs locally.
+#
+# Build and run commands for Nibi are in the README ("HPC clusters") and in
+# %help below (`apptainer run-help path3d.sif`). Build from the repo root,
+# since the %files paths are relative to the directory the build runs in.
+#
+# The image carries its own CUDA runtime (inside the torch wheels), so no base
+# CUDA image is needed. --nv mounts the host's driver, which only has to be
+# new enough for the torch build below.
+
+%help
+    path3d: preprocessing, VALIS registration, segmentation, nuclear detection.
+    `apptainer run` behaves like `python`. On Nibi, inside a Slurm job:
+
+        apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch \
+            --home <cache dir> path3d.sif scripts/run_full.py ...
+
+    --home points to a dedicated directory that holds the model and Java
+    caches (Hugging Face, Cellpose, Bio-Formats) across jobs. Keep the checkout
+    and data under /project or /scratch, which are the paths bound in.
+    Resolved package versions: /opt/path3d/pip-freeze.txt
+
+%labels
+    Maintainer sapopovic@ohri.ca
+    Description path3d: preprocessing, VALIS registration, segmentation, nuclear detection
+    Version 0.1.0
+
+%files
+    pyproject.toml                /opt/path3d/pyproject.toml
+    README.md                     /opt/path3d/README.md
+    LICENSE                       /opt/path3d/LICENSE
+    src                           /opt/path3d/src
+    hpc/container-constraints.txt /opt/path3d/constraints.txt
+
+%post
+    set -eu
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Carried over from pycoda.def, whose builds found security.ubuntu.com and
+    # IPv6 both unreachable from the cluster. Drop the one and force IPv4
+    # rather than wait out timeouts. archive.ubuntu.com has everything below.
+    sed -i '/security\.ubuntu\.com/d' /etc/apt/sources.list
+    APT_OPTS="-o Acquire::Retries=3 -o Acquire::http::Timeout=15 -o Acquire::ForceIPv4=true"
+
+    # python3 is 3.10 on 22.04, matching requires-python and the pycoda env.
+    # The JRE is for VALIS, which reads non-CZI slides through Bio-Formats
+    # (jpype/scyjava). libvips and libopenslide are NOT installed here: they
+    # come from pyvips-binary / openslide-bin, the same builds the local dev
+    # env uses.
+    apt-get update -q $APT_OPTS
+    apt-get install -y --no-install-recommends $APT_OPTS \
+        python3 \
+        python3-pip \
+        openjdk-17-jre-headless \
+        libglib2.0-0 \
+        ca-certificates
+    apt-get clean
+    rm -rf /var/lib/apt/lists/*
+    ln -sf /usr/bin/python3 /usr/local/bin/python
+
+    python -m pip install --no-cache-dir --upgrade pip
+
+    # torch first, from PyTorch's own index: plain PyPI torch is built for
+    # CUDA 13, which needs a newer driver than cu126. To change the build,
+    # swap the index here AND keep the pin in container-constraints.txt on a
+    # version that index actually publishes.
+    python -m pip install --no-cache-dir -c /opt/path3d/constraints.txt \
+        torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+    # Everything else comes from pyproject.toml, so it is never duplicated
+    # here. [binaries] adds the bundled libvips/libopenslide. Those wheels are
+    # what the cluster venv could not use, but inside the container they are
+    # the right choice.
+    #
+    # Sdists are refused so a missing wheel fails immediately and names the
+    # package. The exceptions ship no wheel at all: pyvips (pure-Python
+    # wrapper, the library comes from pyvips-binary), asciitree (via zarr), and
+    # path3d itself.
+    python -m pip install --no-cache-dir -c /opt/path3d/constraints.txt \
+        --only-binary=:all: --no-binary=pyvips,asciitree,path3d \
+        "/opt/path3d[binaries]"
+
+    # cellpose depends on plain opencv-python-headless, valis-wsi on the
+    # contrib build. Both write the same cv2/ directory, so whichever pip
+    # installed last wins. Keep only contrib, which is a superset, and
+    # reinstall it so its files are the ones on disk.
+    python -m pip uninstall -y opencv-python-headless
+    python -m pip install --no-cache-dir --no-deps --force-reinstall \
+        -c /opt/path3d/constraints.txt opencv-contrib-python-headless
+
+    # Record the resolved set. `apptainer exec path3d.sif cat /opt/path3d/pip-freeze.txt`
+    python -m pip freeze > /opt/path3d/pip-freeze.txt
+
+%environment
+    export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+    export PATH="$JAVA_HOME/bin:$PATH"
+    export PYTHONUNBUFFERED=1
+    # Nothing from a host ~/.local should shadow the image's packages.
+    export PYTHONNOUSERSITE=1
+    # Size the thread pools to the CPUs this process may use. Under -C the
+    # host environment (SLURM_CPUS_PER_TASK included) is not passed in, but
+    # nproc honours the job's cpuset. Pass --env OMP_NUM_THREADS=... to override.
+    export OMP_NUM_THREADS="${OMP_NUM_THREADS:-$(nproc)}"
+    export MKL_NUM_THREADS="${MKL_NUM_THREADS:-$OMP_NUM_THREADS}"
+    export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-$OMP_NUM_THREADS}"
+    export VIPS_CONCURRENCY="${VIPS_CONCURRENCY:-$OMP_NUM_THREADS}"
+
+# `apptainer run path3d.sif script.py` behaves like `python script.py`.
+%runscript
+    exec python "$@"
+
+# `apptainer test path3d.sif`. It imports everything, because compiled
+# extensions only fail at import time, never at install time. Run it on a GPU
+# node with --nv to check CUDA too.
+%test
+    python - <<'PY'
+import importlib, sys
+
+MODS = [
+    "numpy", "scipy", "pandas", "skimage", "PIL", "tqdm",
+    "openslide", "pyvips", "aicspylibczi", "cv2", "valis",
+    "torch", "torchvision", "torchstain", "timm", "huggingface_hub", "cellpose",
+    "spatialdata", "anndata", "zarr",
+    "path3d", "path3d.pipeline",
+]
+bad = []
+for m in MODS:
+    try:
+        importlib.import_module(m)
+    except Exception as exc:  # noqa: BLE001 - collect, don't raise
+        bad.append(f"  {m}: {type(exc).__name__}: {exc}")
+
+import cv2, numpy, openslide, pyvips, torch
+print(f"numpy     {numpy.__version__}")
+print(f"opencv    {cv2.__version__}  xfeatures2d={hasattr(cv2, 'xfeatures2d')}")
+print(f"libvips   {pyvips.version_string()}  openslide-loader={pyvips.type_find('VipsForeign', 'openslideload') != 0}")
+print(f"openslide {openslide.__library_version__}")
+print(f"torch     {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+if bad:
+    print("\nFAILED IMPORTS:\n" + "\n".join(bad), file=sys.stderr)
+    sys.exit(1)
+print("\npath3d container OK")
+PY

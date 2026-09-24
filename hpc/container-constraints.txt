@@ -1,0 +1,43 @@
+# Version pins for the Apptainer image (hpc/path3d.def). Passed to pip with -c.
+#
+# These are the versions of the core stack the pycoda environment ran on Nibi,
+# which is the closest thing to a proven set this project has. Two exceptions,
+# each forced by PyPI rather than chosen:
+#   opencv-contrib-python-headless  valis-wsi 1.2.0 on PyPI pins ==4.9.0.80.
+#                                   pycoda's 4.11 came from the wheelhouse, whose
+#                                   valis build had that pin relaxed.
+#   torch / torchvision             PyTorch's cu12x indexes stop at different
+#                                   releases (cu128 ends at 2.11). 2.14.0 is on
+#                                   cu126 and matches the local dev env.
+#
+# Only packages with a real compatibility story are pinned. The rest is left to
+# the resolver and recorded in /opt/path3d/pip-freeze.txt inside the image.
+
+# numerics
+numpy==1.26.4            # valis-wsi requires numpy<2
+scipy==1.15.3
+pandas==2.3.3
+scikit-image==0.24.0     # valis-wsi requires >=0.24; path3d needs >=0.20
+setuptools<81            # xarray-schema imports pkg_resources, removed in 82
+
+# registration
+valis-wsi==1.2.0
+opencv-contrib-python-headless==4.9.0.80
+aicspylibczi==3.3.1
+
+# segmentation and nuclear detection
+torch==2.14.0
+torchvision==0.29.0
+torchstain==1.4.1
+timm==1.0.28
+huggingface_hub==1.24.0
+cellpose==4.2.1.1
+
+# volume assembly. spatialdata 0.3.0 breaks on newer dask/xarray, so those move
+# only together with it.
+spatialdata==0.3.0
+anndata==0.11.4
+zarr==2.18.3
+numcodecs==0.13.1
+dask==2024.11.2
+xarray==2024.11.0
