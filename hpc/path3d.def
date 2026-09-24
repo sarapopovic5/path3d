@@ -135,12 +135,26 @@ for m in MODS:
     except Exception as exc:  # noqa: BLE001 - collect, don't raise
         bad.append(f"  {m}: {type(exc).__name__}: {exc}")
 
-import cv2, numpy, openslide, pyvips, torch
-print(f"numpy     {numpy.__version__}")
-print(f"opencv    {cv2.__version__}  xfeatures2d={hasattr(cv2, 'xfeatures2d')}")
-print(f"libvips   {pyvips.version_string()}  openslide-loader={pyvips.type_find('VipsForeign', 'openslideload') != 0}")
-print(f"openslide {openslide.__library_version__}")
-print(f"torch     {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+# Versions and capabilities, for the log. Each line is guarded on its own: a
+# failed import is already reported above, and only that fails the test.
+def show(name, get):
+    try:
+        print(f"{name:<10}{get()}")
+    except Exception as exc:  # noqa: BLE001 - informational only
+        print(f"{name:<10}?  ({type(exc).__name__}: {exc})")
+
+def vips():
+    import pyvips
+    version = ".".join(str(pyvips.version(i)) for i in range(3))
+    loader = pyvips.type_find("VipsForeign", "openslideload") != 0
+    return f"{version}  openslide-loader={loader}"
+
+show("numpy",     lambda: __import__("numpy").__version__)
+show("opencv",    lambda: (cv2 := __import__("cv2")).__version__ + f"  xfeatures2d={hasattr(cv2, 'xfeatures2d')}")
+show("libvips",   vips)
+show("openslide", lambda: __import__("openslide").__library_version__)
+show("torch",     lambda: (t := __import__("torch")).__version__ + f"  cuda_available={t.cuda.is_available()}")
+
 if bad:
     print("\nFAILED IMPORTS:\n" + "\n".join(bad), file=sys.stderr)
     sys.exit(1)
