@@ -18,7 +18,7 @@ From: ubuntu:22.04
     `apptainer run` behaves like `python`. On Nibi, inside a Slurm job:
 
         apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch \
-            --home <cache dir> --pwd $PWD path3d.sif scripts/run_full.py ...
+            --home <cache dir> --pwd "$(pwd -P)" path3d.sif scripts/run_full.py ...
 
     --home points to a dedicated directory that holds the model and Java
     caches (Hugging Face, Cellpose, Bio-Formats) across jobs. Keep the checkout

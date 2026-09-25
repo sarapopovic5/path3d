@@ -69,11 +69,13 @@ GPU. `--home` points at a directory you create once, for example under your
 group's `/project`. The pipeline's download caches live there and persist
 between jobs: Hugging Face, Cellpose weights, and the Bio-Formats jars VALIS
 fetches. Under `-C` the container starts in that home directory rather than
-where you ran it, so `--pwd $PWD` is needed for relative paths to resolve.
+where you ran it, so `--pwd "$(pwd -P)"` is needed for relative paths to resolve.
+The `-P` matters: `~/projects/<def-xxx>` is a symlink into `/project`, and the
+`/home/...` spelling of the path does not exist inside the container.
 
 ```bash
 P3HOME=/project/<def-xxx>/$USER/path3d-home   # mkdir -p once
-apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd $PWD \
+apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd "$(pwd -P)" \
     path3d.sif scripts/run_full.py ...
 ```
 
@@ -86,7 +88,7 @@ UNI2-h is gated, so log in to Hugging Face once. The token is stored in
 each download them on first use:
 
 ```bash
-A="apptainer run -C -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd $PWD path3d.sif"
+A="apptainer run -C -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd "$(pwd -P)" path3d.sif"
 $A -c "from huggingface_hub import login; login()"
 $A -c "from huggingface_hub import hf_hub_download as d; d('MahmoodLab/UNI2-h', 'pytorch_model.bin')"
 $A -c "from cellpose import models; models.CellposeModel(gpu=False, pretrained_model='cpsam_v2')"
@@ -94,7 +96,7 @@ $A -c "from valis import registration as r; r.init_jvm(); r.kill_jvm()"
 ```
 
 The image contains a snapshot of `src/`. To run a live checkout without
-rebuilding, add `--env PYTHONPATH=$PWD/src` and run from the checkout root.
+rebuilding, add `--env PYTHONPATH="$(pwd -P)/src"` and run from the checkout root.
 Rebuild the image whenever the
 dependencies change. `hpc/container-constraints.txt` holds the version pins,
 and the image records its full resolved set in `/opt/path3d/pip-freeze.txt`.
