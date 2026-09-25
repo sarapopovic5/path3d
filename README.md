@@ -65,16 +65,18 @@ CUDA, run `apptainer test --nv path3d.sif` in a GPU job.
 **Run** with the options the Alliance recommends. `-C` isolates the container
 from the host environment. `-W $SLURM_TMPDIR` keeps temp files on local disk
 rather than RAM. `-B` binds `/project` and `/scratch`, and `--nv` exposes the
-GPU. `--home` points at a directory you create once, for example under your
-group's `/project`. The pipeline's download caches live there and persist
-between jobs: Hugging Face, Cellpose weights, and the Bio-Formats jars VALIS
-fetches. Under `-C` the container starts in that home directory rather than
+GPU. `--home` points at a directory you create once. The pipeline's download
+caches live there and persist between jobs: Hugging Face, Cellpose weights,
+and the Bio-Formats jars VALIS fetches. It also holds your Hugging Face token,
+so keep it private, in your own `$HOME` rather than a group `/project` space.
+Only that one directory is mounted, not the rest of `$HOME`, and the caches
+come to about 4 GB. Under `-C` the container starts in that home directory rather than
 where you ran it, so `--pwd "$(pwd -P)"` is needed for relative paths to resolve.
 The `-P` matters: `~/projects/<def-xxx>` is a symlink into `/project`, and the
 `/home/...` spelling of the path does not exist inside the container.
 
 ```bash
-P3HOME=/project/<def-xxx>/$USER/path3d-home   # mkdir -p once
+P3HOME=$HOME/path3d-home   # once: mkdir -p $P3HOME && chmod 700 $P3HOME
 apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd "$(pwd -P)" \
     path3d.sif scripts/run_full.py ...
 ```
