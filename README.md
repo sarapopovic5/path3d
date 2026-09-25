@@ -68,20 +68,25 @@ rather than RAM. `-B` binds `/project` and `/scratch`, and `--nv` exposes the
 GPU. `--home` points at a directory you create once, for example under your
 group's `/project`. The pipeline's download caches live there and persist
 between jobs: Hugging Face, Cellpose weights, and the Bio-Formats jars VALIS
-fetches.
+fetches. Under `-C` the container starts in that home directory rather than
+where you ran it, so `--pwd $PWD` is needed for relative paths to resolve.
 
 ```bash
 P3HOME=/project/<def-xxx>/$USER/path3d-home   # mkdir -p once
-apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME \
+apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd $PWD \
     path3d.sif scripts/run_full.py ...
 ```
+
+Nibi already binds `/project` and `/scratch` into every container, so there
+the `-B` options only produce a harmless "destination is already in the mount
+point list" warning. They are kept for clusters that do not.
 
 UNI2-h is gated, so log in to Hugging Face once. The token is stored in
 `$P3HOME`. Optionally, pre-fetch the models too, so that parallel jobs don't
 each download them on first use:
 
 ```bash
-A="apptainer run -C -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME path3d.sif"
+A="apptainer run -C -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd $PWD path3d.sif"
 $A -c "from huggingface_hub import login; login()"
 $A -c "from huggingface_hub import hf_hub_download as d; d('MahmoodLab/UNI2-h', 'pytorch_model.bin')"
 $A -c "from cellpose import models; models.CellposeModel(gpu=False, pretrained_model='cpsam_v2')"
@@ -89,7 +94,8 @@ $A -c "from valis import registration as r; r.init_jvm(); r.kill_jvm()"
 ```
 
 The image contains a snapshot of `src/`. To run a live checkout without
-rebuilding, add `--env PYTHONPATH=$PWD/src`, run from the checkout root. Rebuild the image whenever the
+rebuilding, add `--env PYTHONPATH=$PWD/src` and run from the checkout root.
+Rebuild the image whenever the
 dependencies change. `hpc/container-constraints.txt` holds the version pins,
 and the image records its full resolved set in `/opt/path3d/pip-freeze.txt`.
 
