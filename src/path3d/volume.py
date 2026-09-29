@@ -321,27 +321,7 @@ def build_volume(
         if nuclear_parquet_path is not None:
             merged.to_parquet(str(nuclear_parquet_path), engine="pyarrow")
 
-        try:
-            import anndata as ad
-            from spatialdata.models import TableModel
-        except ImportError as exc:
-            raise ImportError(
-                "anndata and spatialdata are required. "
-                "Install: pip install anndata spatialdata"
-            ) from exc
-
-        spatial_3d = merged[["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64)
-        obs = merged.drop(columns=["z_um", "y_um", "x_um"]).reset_index(drop=True)
-        obs.index = obs.index.astype(str)
-        adata = ad.AnnData(obs=obs)
-        adata.obsm["spatial_3d"] = spatial_3d
-
-        tables["nuclei"] = TableModel.parse(
-            adata,
-            region="tissue_labels",
-            region_key="region",
-            instance_key="instance_id",
-        )
+        tables["nuclei"] = nuclei_table(merged)
 
     sdata = SpatialData(labels={"tissue_labels": labels_el}, tables=tables)
 
@@ -349,6 +329,50 @@ def build_volume(
         sdata.write(str(output_path))
 
     return sdata
+
+
+def nuclei_table(merged: pd.DataFrame):
+    """Wrap a merged nuclear table as the ``tables["nuclei"]`` element.
+
+    ``merged`` is what ``build_volume`` writes to ``nuclear_parquet_path``: one
+    row per nucleus with ``z_um, y_um, x_um`` in ``microns_3d``, a global
+    ``instance_id``, and ``region == "tissue_labels"``. Reading that parquet
+    back through here attaches the same nuclei to any volume whose label
+    element is also ``tissue_labels`` and shares ``microns_3d`` -- e.g. a
+    niche volume, without redoing registration or nuclear detection.
+
+    Raises:
+        ImportError: anndata or spatialdata is not installed.
+        KeyError: a required column is missing.
+    """
+    try:
+        import anndata as ad
+        from spatialdata.models import TableModel
+    except ImportError as exc:
+        raise ImportError(
+            "anndata and spatialdata are required. "
+            "Install: pip install anndata spatialdata"
+        ) from exc
+
+    missing = [
+        c for c in ("z_um", "y_um", "x_um", "instance_id", "region")
+        if c not in merged.columns
+    ]
+    if missing:
+        raise KeyError(f"nuclear table is missing column(s): {missing}")
+
+    spatial_3d = merged[["z_um", "y_um", "x_um"]].to_numpy(dtype=np.float64)
+    obs = merged.drop(columns=["z_um", "y_um", "x_um"]).reset_index(drop=True)
+    obs.index = obs.index.astype(str)
+    adata = ad.AnnData(obs=obs)
+    adata.obsm["spatial_3d"] = spatial_3d
+
+    return TableModel.parse(
+        adata,
+        region="tissue_labels",
+        region_key="region",
+        instance_key="instance_id",
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -88,7 +88,8 @@ def predict_sections(
         stride: keep every ``stride``-th grid cell in each axis -- a fast
             full-extent preview of the whole stack at 1/stride^2 the cost.
         device: torch device override.
-        skip_existing: reuse a section's CSV if it is already on disk.
+        skip_existing: reuse a section's CSV if it is already on disk. Raises
+            if that CSV was predicted with a different ``stride``.
         cache_embeddings: checkpoint each section's UNI2-h embeddings to
             ``output_dir/embeddings/{idx:04d}.npz``. Costs ~75 MB per 25 000
             tiles and makes an interrupted section resume mid-way rather than
@@ -120,7 +121,18 @@ def predict_sections(
         meta_path = tiles_dir / f"{index:04d}_meta.json"
 
         if skip_existing and csv_path.exists() and meta_path.exists():
-            metas[str(path)] = json.loads(meta_path.read_text())
+            cached = json.loads(meta_path.read_text())
+            # A strided preview is a sparse subset of the grid. Reusing it as
+            # a full run would leave (stride^2 - 1)/stride^2 of every section
+            # empty without any error, so refuse to mix the two.
+            if int(cached.get("stride", 1)) != stride:
+                raise ValueError(
+                    f"{csv_path} was predicted with stride "
+                    f"{cached.get('stride', 1)}, but this run asks for stride "
+                    f"{stride}. Write previews and full runs to different "
+                    f"output directories."
+                )
+            metas[str(path)] = cached
             if verbose:
                 print(f"[{index:04d}] cached -> {csv_path.name}", flush=True)
             continue

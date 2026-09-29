@@ -34,6 +34,14 @@ def _section(shape=(8, 10), winner="epithelium", grid_um=32.0):
     )
 
 
+def _affine(element):
+    from spatialdata.transformations import get_transformation
+
+    return get_transformation(element, "microns_3d").to_affine_matrix(
+        input_axes=("z", "y", "x"), output_axes=("z", "y", "x")
+    )
+
+
 def _manifest(tmp_path, n, thickness=None):
     rows = ["section_index,filename,path" + (",thickness_um" if thickness else "")]
     paths = []
@@ -98,26 +106,35 @@ class TestVolumeGeometry:
         sdata = build_niche_volume(csv, sections, z_spacing_um=12.0)
         assert sdata.labels["tissue_labels"].shape[0] == 3
 
-    def test_target_voxel_um_forces_isotropy(self, tmp_path):
+    def test_target_voxel_um_refines_in_plane_to_a_cube(self, tmp_path):
         csv, paths = _manifest(tmp_path, 2)
         sections = {str(p): _section(shape=(8, 10)) for p in paths}
 
         sdata = build_niche_volume(
-            csv, sections, z_spacing_um=12.0, target_voxel_um=16.0
+            csv, sections, z_spacing_um=16.0, target_voxel_um=16.0
         )
 
-        from spatialdata.transformations import get_transformation
-
-        m = get_transformation(
-            sdata.labels["tissue_labels"], "microns_3d"
-        ).to_affine_matrix(
-            input_axes=("z", "y", "x"), output_axes=("z", "y", "x")
-        )
-        # z stays physical; in-plane is resampled to the requested size.
-        assert m[0, 0] == pytest.approx(12.0)
-        assert m[1, 1] == pytest.approx(16.0)
+        m = _affine(sdata.labels["tissue_labels"])
+        assert (m[0, 0], m[1, 1], m[2, 2]) == pytest.approx((16.0, 16.0, 16.0))
         # 32 um grid -> 16 um voxels doubles the in-plane extent.
-        assert sdata.labels["tissue_labels"].shape[1:] == (16, 20)
+        assert sdata.labels["tissue_labels"].shape == (2, 16, 20)
+
+    def test_target_finer_than_section_spacing_is_refused(self, tmp_path):
+        """A cube thinner than a section would have to invent data in z."""
+        csv, paths = _manifest(tmp_path, 2)
+        sections = {str(p): _section() for p in paths}
+        with pytest.raises(ValueError, match="whole multiple"):
+            build_niche_volume(
+                csv, sections, z_spacing_um=12.0, target_voxel_um=8.0
+            )
+
+    def test_target_not_a_whole_number_of_sections_is_refused(self, tmp_path):
+        csv, paths = _manifest(tmp_path, 4)
+        sections = {str(p): _section() for p in paths}
+        with pytest.raises(ValueError, match="whole multiple"):
+            build_niche_volume(
+                csv, sections, z_spacing_um=12.0, target_voxel_um=32.0
+            )
 
     def test_coarsening_via_target_voxel_um_is_refused(self, tmp_path):
         csv, paths = _manifest(tmp_path, 2)
@@ -126,6 +143,78 @@ class TestVolumeGeometry:
             build_niche_volume(
                 csv, sections, z_spacing_um=12.0, target_voxel_um=250.0
             )
+
+
+class TestCubicBinning:
+    """32 um cubes from 8 um sections: every 4 sections average into 1 slab."""
+
+    def test_both_elements_get_cubic_voxels(self, tmp_path):
+        csv, paths = _manifest(tmp_path, 8)
+        sections = {str(p): _section() for p in paths}
+        sdata = build_niche_volume(
+            csv, sections, z_spacing_um=8.0, target_voxel_um=32.0
+        )
+        for element in (
+            sdata.labels["tissue_labels"],
+            sdata.images["niche_probabilities"],
+        ):
+            m = _affine(element)
+            assert (m[0, 0], m[1, 1], m[2, 2]) == pytest.approx((32.0, 32.0, 32.0))
+        assert sdata.labels["tissue_labels"].shape == (2, 8, 10)
+        assert sdata.attrs["niche_voxel_um_zyx"] == [32.0, 32.0, 32.0]
+        assert sdata.attrs["niche_sections_per_voxel"] == 4
+
+    def test_slab_is_the_mean_of_its_sections(self, tmp_path):
+        csv, paths = _manifest(tmp_path, 4)
+        sections = {}
+        for i, p in enumerate(paths):
+            s = _section()
+            s.probs[CLASSES.index("immune")] = 0.1 * (i + 1)  # 0.1 .. 0.4
+            sections[str(p)] = s
+        sdata = build_niche_volume(
+            csv, sections, z_spacing_um=8.0, target_voxel_um=32.0
+        )
+        immune = np.asarray(sdata.images["niche_probabilities"].data)[
+            CLASSES.index("immune")
+        ]
+        assert immune.shape == (1, 8, 10)
+        np.testing.assert_allclose(immune, 0.25, rtol=1e-6)
+
+    def test_slab_is_tissue_only_where_most_sections_are(self, tmp_path):
+        """Tissue in 2 of 4 sections counts; tissue in 1 of 4 does not."""
+        csv, paths = _manifest(tmp_path, 4)
+        sections = {}
+        for i, p in enumerate(paths):
+            s = _section(shape=(2, 2))
+            # cell (0, 0): tissue in sections 0-1 only; cell (0, 1): section 0 only
+            if i >= 2:
+                s.probs[:, 0, 0] = np.nan
+            if i >= 1:
+                s.probs[:, 0, 1] = np.nan
+            sections[str(p)] = s
+        sdata = build_niche_volume(
+            csv, sections, z_spacing_um=8.0, target_voxel_um=32.0
+        )
+        labels = np.asarray(sdata.labels["tissue_labels"].data)[0]
+        assert labels[0, 0] == NICHE_LABEL_INDEX["epithelium"]
+        assert labels[0, 1] == 0
+        assert (labels[1] == NICHE_LABEL_INDEX["epithelium"]).all()
+        # The mean ignores the sections without tissue rather than diluting.
+        epi = np.asarray(sdata.images["niche_probabilities"].data)[
+            CLASSES.index("epithelium"), 0
+        ]
+        assert epi[0, 0] == pytest.approx(0.7)
+        assert np.isnan(epi[0, 1])
+
+    def test_trailing_partial_slab_is_dropped_with_a_warning(self, tmp_path):
+        csv, paths = _manifest(tmp_path, 9)
+        sections = {str(p): _section() for p in paths}
+        with pytest.warns(UserWarning, match=r"\[8\]"):
+            sdata = build_niche_volume(
+                csv, sections, z_spacing_um=8.0, target_voxel_um=32.0
+            )
+        assert sdata.labels["tissue_labels"].shape[0] == 2
+        assert sdata.attrs["niche_dropped_sections"] == [8]
 
 
 class TestElements:

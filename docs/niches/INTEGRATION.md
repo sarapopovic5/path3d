@@ -39,6 +39,37 @@ sdata = run_niche_pipeline(
 Per-section CSVs are written as each section finishes, so a walltime kill loses
 only the section in flight; re-running skips what is already on disk.
 
+### The whole stack, as one run directory
+
+`python -m path3d.niches.run` does the same and writes the result in the layout
+of a `run_pipeline` + volume-build run (`full_volume_dpt/`):
+
+```
+OUT/volume_niches_32um.zarr       labels + probabilities (+ nuclei)
+OUT/label_maps/NNNN_labels{,_rgb}.png
+OUT/quantification/soft_volumetrics.csv, per_section_profile.csv
+OUT/manifest_thickness_8um.csv
+OUT/volume_build_metadata.json
+OUT/niches/{tiles,embeddings}/
+```
+
+On the cluster, from the repo root, inside the path3d Apptainer image:
+
+```bash
+mkdir -p $SCRATCH/path3d_niches/logs   # outputs land in $SCRATCH/path3d_niches too
+SIF=/path/to/path3d.sif STRIDE=4 sbatch scripts/build_niche_volume.sh   # preview
+SIF=/path/to/path3d.sif sbatch scripts/build_niche_volume.sh            # full run
+```
+
+The job bind-mounts the checkout over the image's copy of path3d, so a
+`git pull` takes effect without rebuilding the image. Resubmit it after a
+walltime kill. Everything after prediction runs from `niches/tiles` alone, so
+`--skip-predict` rebuilds the volume without a GPU.
+`--nuclei-parquet full_volume_dpt/nuclei_dpt_8um.parquet` attaches the same
+nuclei the DPT volume carries. View the result with
+`python scripts/view_volume.py OUT/volume_niches_32um.zarr`; it detects a niche
+volume and uses the `HGSC_niches` palette.
+
 ## Run the model on the registered sections, not the raw slides
 
 Two hard reasons:
@@ -108,9 +139,17 @@ thickness × sampling interval. If you cut 4 µm sections and imaged every third
 it is 12 µm, not 4 µm. Omit it and it is read from a uniform `thickness_um`
 column; it raises rather than guess.
 
-Pass `target_voxel_um` to force isotropy. You need it for
+Pass `target_voxel_um` for cubic voxels. You need it for
 `quantification.compute_volumetrics`, which takes a single scalar `voxel_um` and
-assumes cubic voxels.
+assumes cubic voxels. It must be a whole multiple of the section spacing, and
+that many consecutive sections are **averaged into one slab**: 32 µm cubes from
+8 µm sections average 4. That is the z counterpart of rasterising at a coarser
+`grid_um`. A slab voxel is tissue when at least half its sections are, the same
+majority rule the in-plane grid applies, so the tissue boundary does not move
+with the cube size. Trailing sections that do not fill a whole slab (149 = 37 × 4
++ 1) are left out, with a warning, and listed in
+`volume_build_metadata.json`. A cube finer than the section spacing is refused,
+since it would have to invent data between sections.
 
 ## Probabilities are the deliverable; the label volume is for viewing
 

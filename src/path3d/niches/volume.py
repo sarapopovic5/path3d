@@ -128,6 +128,71 @@ def _resample_inplane(
     return out
 
 
+def _z_bin_factor(z_um: float, target_voxel_um: float | None) -> int:
+    """How many consecutive sections make up one ``target_voxel_um`` voxel.
+
+    A cubic voxel has to be built from whole sections, so the target must be a
+    whole multiple of the section spacing: 32 um from 8 um sections is 4 of
+    them. Anything finer than one section would have to invent data between
+    sections, so it is refused rather than interpolated.
+
+    Raises:
+        ValueError: ``target_voxel_um`` is finer than, or not a whole multiple
+            of, ``z_um``.
+    """
+    if target_voxel_um is None:
+        return 1
+    ratio = target_voxel_um / z_um
+    factor = int(round(ratio))
+    if factor < 1 or abs(ratio - factor) > 1e-6:
+        raise ValueError(
+            f"target_voxel_um ({target_voxel_um}) must be a whole multiple of "
+            f"the section spacing ({z_um} um), so that every voxel is made of "
+            f"whole sections. With {z_um} um sections, valid cube sizes are "
+            f"{z_um:g}, {2 * z_um:g}, {3 * z_um:g}, {4 * z_um:g} um, ..."
+        )
+    return factor
+
+
+def _bin_sections(probs: np.ndarray, factor: int) -> tuple[np.ndarray, list[int]]:
+    """Average each run of ``factor`` consecutive sections into one z-slab.
+
+    The z counterpart of ``rasterize_tiles`` averaging the tiles inside a grid
+    cell: each slab's probability is the mean over the sections in it that
+    carry a prediction. A slab voxel counts as tissue only when at least half
+    of its sections do -- the same majority rule the in-plane grid applies by
+    keeping a tile only when its centre is on tissue -- so the tissue boundary
+    neither grows nor shrinks with ``factor``.
+
+    Args:
+        probs: ``(c, z, y, x)``, NaN off-tissue.
+        factor: sections per slab.
+
+    Returns:
+        ``(c, z // factor, y, x)`` float32, and the indices of the trailing
+        sections that did not fill a whole slab and were left out.
+
+    Raises:
+        ValueError: fewer sections than ``factor``.
+    """
+    n_classes, n_z, ny, nx = probs.shape
+    n_slabs = n_z // factor
+    if n_slabs < 1:
+        raise ValueError(
+            f"Only {n_z} section(s), too few to fill one voxel of {factor} "
+            f"sections."
+        )
+    dropped = list(range(n_slabs * factor, n_z))
+
+    blocks = probs[:, : n_slabs * factor].reshape(n_classes, n_slabs, factor, ny, nx)
+    valid = np.isfinite(blocks).all(axis=0)  # (slab, section-in-slab, y, x)
+    n_valid = valid.sum(axis=1)
+    total = np.where(valid[None], blocks, 0.0).sum(axis=2)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        mean = total / n_valid
+    return np.where(2 * n_valid >= factor, mean, np.nan).astype(np.float32), dropped
+
+
 def build_niche_volume(
     manifest_csv: str | Path,
     sections: dict[str, NicheSection],
@@ -164,8 +229,13 @@ def build_niche_volume(
             in-plane smoothing. ``0`` (the default) disables it -- enable only
             if you trust the registration to better than one grid cell, since
             it mixes neighbouring sections' probabilities.
-        target_voxel_um: force isotropic voxels of this size, resampling
-            in-plane. Leave None to keep native anisotropic
+        target_voxel_um: build cubic voxels of this size. In-plane it may
+            equal ``grid_um`` or refine it (nearest-neighbour replication); in
+            z it must be a whole multiple of ``z_spacing_um``, and each run of
+            that many sections is averaged into one slab (see
+            :func:`_bin_sections`). 32 um from 8 um sections averages 4. Any
+            trailing sections that do not fill a whole slab are left out, with
+            a warning. Leave None to keep native anisotropic
             ``(z_spacing_um, grid_um, grid_um)``. Required if you intend to
             call ``quantification.compute_volumetrics``, which assumes cubic
             voxels.
@@ -183,8 +253,10 @@ def build_niche_volume(
         ImportError: spatialdata is not installed (``pip install path3d[volume]``).
         KeyError: a manifest path has no entry in ``sections``.
         ValueError: sections disagree on grid shape, classes or ``grid_um``;
-            or ``target_voxel_um`` would downsample (rasterise at a coarser
-            ``grid_um`` instead, which averages properly rather than aliasing).
+            ``target_voxel_um`` is coarser than ``grid_um`` (rasterise at a
+            coarser ``grid_um`` instead, which averages properly rather than
+            aliasing); or ``target_voxel_um`` is not a whole multiple of
+            ``z_spacing_um``.
     """
     try:
         from spatialdata import SpatialData
@@ -231,6 +303,21 @@ def build_niche_volume(
                 f"{grid_um}."
             )
 
+    # Validate the requested cube before any of the heavy array work.
+    if target_voxel_um is not None:
+        if target_voxel_um <= 0:
+            raise ValueError(
+                f"target_voxel_um must be > 0, got {target_voxel_um}"
+            )
+        if target_voxel_um > grid_um:
+            raise ValueError(
+                f"target_voxel_um ({target_voxel_um}) is coarser than the niche "
+                f"grid ({grid_um} um); that would alias. Rasterise at "
+                f"grid_um={target_voxel_um} instead -- rasterize_tiles averages "
+                f"the tiles in each cell, which is the correct way to coarsen."
+            )
+    z_bin = _z_bin_factor(z_um, target_voxel_um)
+
     n_voxels = len(ordered) * int(np.prod(reference.shape))
     if n_voxels > _VOXEL_WARN_THRESHOLD:
         warnings.warn(
@@ -267,28 +354,28 @@ def build_niche_volume(
         # invent tissue in the gaps between sections.
         probs[~valid] = np.nan
 
+    dropped: list[int] = []
+    if z_bin > 1:
+        probs, dropped = _bin_sections(probs, z_bin)
+        if dropped:
+            warnings.warn(
+                f"{len(dropped)} trailing section(s) {dropped} do not fill a "
+                f"whole {target_voxel_um:g} um voxel ({z_bin} sections of "
+                f"{z_um:g} um) and are left out of the volume.",
+                stacklevel=2,
+            )
+
     labels = np.stack(
         [argmax_labels(probs[:, k], classes) for k in range(probs.shape[1])], axis=0
     ).astype(np.uint8)
 
-    voxel_zyx = (z_um, grid_um, grid_um)
+    voxel_zyx = (z_um * z_bin, grid_um, grid_um)
     if target_voxel_um is not None:
-        if target_voxel_um <= 0:
-            raise ValueError(
-                f"target_voxel_um must be > 0, got {target_voxel_um}"
-            )
-        if target_voxel_um > grid_um:
-            raise ValueError(
-                f"target_voxel_um ({target_voxel_um}) is coarser than the niche "
-                f"grid ({grid_um} um); that would alias. Rasterise at "
-                f"grid_um={target_voxel_um} instead -- rasterize_tiles averages "
-                f"the tiles in each cell, which is the correct way to coarsen."
-            )
         probs = _resample_inplane(probs, grid_um, target_voxel_um, is_label=False)
         labels = _resample_inplane(
             labels, grid_um, target_voxel_um, is_label=True
         )
-        voxel_zyx = (z_um, target_voxel_um, target_voxel_um)
+        voxel_zyx = (target_voxel_um, target_voxel_um, target_voxel_um)
 
     # Index (z, y, x) -> microns. Diagonal, but NOT uniform: the z scale is the
     # physical inter-section spacing and the in-plane scales are the niche grid
@@ -325,6 +412,8 @@ def build_niche_volume(
     sdata.attrs["niche_classes"] = list(classes)
     sdata.attrs["niche_voxel_um_zyx"] = [float(v) for v in voxel_zyx]
     sdata.attrs["niche_background_index"] = int(NICHE_BACKGROUND_INDEX)
+    sdata.attrs["niche_sections_per_voxel"] = int(z_bin)
+    sdata.attrs["niche_dropped_sections"] = [int(i) for i in dropped]
 
     if output_path is not None:
         sdata.write(str(output_path))
