@@ -90,11 +90,15 @@ export TMPDIR="${SLURM_TMPDIR:-/tmp}"
 export HF_HUB_OFFLINE=1
 export APPTAINERENV_PYTHONPATH="/opt/path3d-src/src"
 
-# /home, /project and /scratch hold the manifest, registered sections, HF
-# cache and outputs; the repo is mounted at /opt/path3d-src.
+# The cluster's Apptainer config already binds /project and /scratch (binding
+# them again only prints warnings); /home holds the manifest symlinks and the
+# Hugging Face cache. The repo is mounted at /opt/path3d-src.
+# The host's module PYTHONPATH (cvmfs site-packages) is deliberately not
+# forwarded -- APPTAINERENV_PYTHONPATH takes precedence, and Apptainer says so
+# with a harmless warning.
 CONTAINER=(
     apptainer exec --nv
-    --bind /home,/project,/scratch
+    --bind /home
     --bind "$TMPDIR"
     --bind "$REPO_DIR:/opt/path3d-src"
     "$SIF"
@@ -117,7 +121,7 @@ echo "======================================================"
 # checkout, the GPU is visible, and UNI2-h is cached -- before an hour in queue
 # turns into a crash on the first import.
 "${CONTAINER[@]}" python - <<'PY'
-import importlib, sys
+import importlib.util, sys
 missing = [m for m in ("sklearn", "joblib", "spatialdata", "anndata", "pyarrow",
                        "zarr", "timm", "huggingface_hub", "tifffile", "PIL")
            if importlib.util.find_spec(m) is None]
