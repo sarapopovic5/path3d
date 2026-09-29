@@ -88,6 +88,11 @@ export TMPDIR="${SLURM_TMPDIR:-/tmp}"
 # To fetch it, on a login node after `hf auth login`:
 #   apptainer exec $SIF python -c "from huggingface_hub import snapshot_download; snapshot_download('MahmoodLab/UNI2-h')"
 export HF_HUB_OFFLINE=1
+# The cluster points these at host CA bundles that do not exist inside the
+# image. huggingface_hub builds an HTTP client even in offline mode, and it
+# crashes on a missing SSL_CERT_FILE before it ever falls back to the cache.
+# Unset, the container uses its own certificates.
+unset SSL_CERT_FILE REQUESTS_CA_BUNDLE CURL_CA_BUNDLE
 export APPTAINERENV_PYTHONPATH="/opt/path3d-src/src"
 
 # The cluster's Apptainer config already binds /project and /scratch (binding
@@ -140,6 +145,14 @@ try:
 except Exception as exc:
     sys.exit(f"UNI2-h is not in the Hugging Face cache ({exc}). Download it on "
              f"a login node -- see the comment above HF_HUB_OFFLINE in this script.")
+# The same lookup timm.create_model does. Unlike local_files_only above, it
+# goes through huggingface_hub's HTTP client, so it catches environment
+# problems (e.g. a host SSL_CERT_FILE) that only surface when the model loads.
+from timm.models._hub import download_from_hf
+try:
+    download_from_hf("MahmoodLab/UNI2-h", "config.json")
+except Exception as exc:
+    sys.exit(f"timm cannot resolve UNI2-h offline: {exc!r}")
 PY
 
 ARGS=(

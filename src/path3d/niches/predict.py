@@ -446,10 +446,13 @@ def load_encoder(device: str | None = None):
         )
     except Exception as exc:
         raise RuntimeError(
-            "Could not load MahmoodLab/UNI2-h. It is a GATED model: request "
-            "access at https://huggingface.co/MahmoodLab/UNI2-h, then run "
-            "`hf auth login` with a read token. (huggingface_hub 1.x renamed "
-            "the CLI -- it is `hf auth login`, not `huggingface-cli login`.)"
+            f"Could not load MahmoodLab/UNI2-h: {exc!r}. If that is an "
+            f"authorisation error: it is a GATED model -- request access at "
+            f"https://huggingface.co/MahmoodLab/UNI2-h, then run `hf auth "
+            f"login` with a read token (huggingface_hub 1.x renamed the CLI "
+            f"-- it is `hf auth login`, not `huggingface-cli login`). Offline "
+            f"(HF_HUB_OFFLINE=1), the weights must already be cached, and an "
+            f"SSL_CERT_FILE pointing at a missing file still breaks the load."
         ) from exc
     return model, device, dtype
 
