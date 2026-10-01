@@ -68,25 +68,22 @@ grows the same way, to ~1.2 GB per section.
 
 ### On the cluster
 
-From the repo root, inside the path3d Apptainer image. The default is an 8 µm
-step, split across a 10-task GPU job array, with a CPU job that builds the
-volume once the array has ended:
+From the repo root, inside the path3d Apptainer image:
 
 ```bash
 mkdir -p $SCRATCH/path3d_niches/logs   # outputs land in $SCRATCH/path3d_niches too
-SIF=/path/to/path3d.sif STRIDE=4 bash scripts/submit_niche_volume.sh   # preview
-SIF=/path/to/path3d.sif bash scripts/submit_niche_volume.sh            # full run
-SIF=/path/to/path3d.sif TASKS=3,7 bash scripts/submit_niche_volume.sh  # redo tasks
+SIF=/path/to/path3d.sif STRIDE=4 sbatch scripts/build_niche_volume.sh   # preview
+SIF=/path/to/path3d.sif sbatch scripts/build_niche_volume.sh            # full run
 ```
 
-Task *i* of *N* predicts manifest rows *i*, *i+N*, …, interleaved, so every
-task gets a similar mix of large and small sections. The build job uses
-`afterany`, so it runs even if a task failed, and then refuses to build,
-naming the missing sections. Resubmit those tasks with `TASKS=`: finished
-sections are skipped, and a half-done one resumes from its embedding
-checkpoint. `STEP_UM=32` reproduces the original 32 µm run. Runs with
-different steps go to different directories, and a run refuses tiles
-predicted at another step.
+The default is an 8 µm step, written to `$SCRATCH/path3d_niches/niches_full_8um`.
+`STEP_UM=32` reproduces the original 32 µm run. At 16× the tiles, an 8 µm run
+does not finish inside one 24 h walltime. Resubmit the same command until the
+volume is written: finished sections are skipped, and a half-done one resumes
+from its embedding checkpoint. Runs with different steps go to different
+directories, and a run refuses tiles predicted at another step. The runner
+can also split prediction across GPUs (`--task-index`/`--task-count`,
+`--predict-only`, then `--skip-predict`) if you ever want that.
 
 The job bind-mounts the checkout over the image's copy of path3d, so a
 `git pull` takes effect without rebuilding the image. Everything after
