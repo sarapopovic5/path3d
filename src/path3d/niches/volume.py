@@ -330,7 +330,7 @@ def build_niche_volume(
         )
 
     # (c, z, y, x)
-    probs = np.stack([s.probs for s in ordered], axis=1).astype(np.float32)
+    probs = np.stack([s.probs for s in ordered], axis=1).astype(np.float32, copy=False)
 
     if smooth_um > 0:
         sigma_cells = smooth_um / grid_um

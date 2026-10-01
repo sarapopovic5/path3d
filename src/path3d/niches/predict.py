@@ -714,6 +714,7 @@ def predict_slide(
     mask_level: int = 4,
     limit: int = 0,
     stride: int = 1,
+    step_um: float | None = None,
     device: str | None = None,
     encoder=None,
     cache_path: str | Path | None = None,
@@ -737,6 +738,12 @@ def predict_slide(
             section -- use ``stride`` for a representative preview.
         stride: keep every ``stride``-th grid cell in each axis; a fast
             full-extent preview at 1/stride^2 the cost.
+        step_um: spacing between tile centres, microns. Defaults to the
+            model's own ``tile_um`` (32). A smaller step predicts more densely
+            -- 8 um is 16x the tiles -- with the SAME ``fov_um`` window around
+            each centre, so neighbouring windows overlap heavily. That locates
+            boundaries on a finer grid, but each prediction still sees 112 um
+            of context, so it does not resolve structure finer than that.
         device: torch device override.
         encoder: preloaded encoder from :func:`load_encoder`, to amortise the
             ~2.5 GB model load across a whole section stack.
@@ -747,7 +754,8 @@ def predict_slide(
         ``(tiles, meta)``. ``tiles`` has ``cx_px, cy_px, x0_px, y0_px``, one
         ``p_<class>`` per class, ``argmax_class``, and one ``call_<class>`` per
         class. ``meta`` carries ``mpp``, ``canvas_wh``, ``classes``,
-        ``tile_um``, ``fov_um``, ``n_tiles``, ``tissue_frac``, ``mask_level``.
+        ``tile_um``, ``step_um``, ``fov_um``, ``n_tiles``, ``tissue_frac``,
+        ``mask_level``.
 
     Raises:
         ValueError: no tiles landed on tissue -- check ``mpp`` and the slide.
@@ -793,11 +801,14 @@ def predict_slide(
         if verbose:
             log(f"tissue: {100 * tissue.mean():.1f}% of frame at level {ml}")
 
+        step = float(step_um) if step_um is not None else model.tile_um
+        if step <= 0:
+            raise ValueError(f"step_um must be > 0, got {step_um}")
         tiles = tile_grid(
             (w0, h0),
             mpp,
             tissue,
-            tile_um=model.tile_um,
+            tile_um=step,
             fov_um=model.fov_um,
             stride=stride,
         )
@@ -808,10 +819,10 @@ def predict_slide(
             spacing = (
                 ""
                 if stride == 1
-                else f" (stride {stride}: every {stride * model.tile_um:.0f}um)"
+                else f" (stride {stride}: every {stride * step:.0f}um)"
             )
             log(
-                f"{len(tiles):,} tiles on a {model.tile_um:.0f}um grid, "
+                f"{len(tiles):,} tiles on a {step:g}um grid, "
                 f"{fov}px ({model.fov_um:.0f}um) windows{spacing}"
             )
         if not len(tiles):
@@ -842,6 +853,7 @@ def predict_slide(
         "canvas_wh": (int(w0), int(h0)),
         "classes": list(model.classes),
         "tile_um": float(model.tile_um),
+        "step_um": float(step),
         "fov_um": float(model.fov_um),
         "n_tiles": int(len(tiles)),
         "tissue_frac": float(tissue.mean()),
@@ -1056,7 +1068,7 @@ def main(argv: list[str] | None = None) -> int:
         slide=meta["slide"],
         mpp=meta["mpp"],
         n_tiles=meta["n_tiles"],
-        tissue_mm2=float(meta["n_tiles"] * meta["tile_um"] ** 2 / 1e6),
+        tissue_mm2=float(meta["n_tiles"] * meta["step_um"] ** 2 / 1e6),
         blocks_250um=int(cnt.astype(bool).sum()),
         mean_prob={
             c: float(tiles[col].mean())

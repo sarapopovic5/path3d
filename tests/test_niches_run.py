@@ -15,7 +15,7 @@ import pytest
 
 from path3d.niches.pipeline import predict_sections
 from path3d.niches.predict import prob_columns
-from path3d.niches.run import build_niche_run
+from path3d.niches.run import build_niche_run, main
 
 pytest.importorskip("spatialdata")
 
@@ -24,20 +24,26 @@ MPP, STEP = 0.5, 64  # 32 um tiles at 0.5 um/px
 NY, NX = 10, 12
 
 
-def _fake_run(tmp_path, n_sections, *, stride=1, skip=()):
-    """Manifest + per-section tile CSVs as predict_sections would leave them."""
+def _fake_run(tmp_path, n_sections, *, stride=1, skip=(), step_um=32.0):
+    """Manifest + per-section tile CSVs as predict_sections would leave them.
+
+    The canvas is always NX x NY cells of 32 um; ``step_um`` places tile
+    centres on a finer grid over the same canvas.
+    """
     tiles_dir = tmp_path / "out" / "niches" / "tiles"
     tiles_dir.mkdir(parents=True)
     rows = ["section_index,filename,path"]
     rng = np.random.default_rng(0)
-    gy, gx = np.mgrid[0:NY, 0:NX]
-    on = (gx >= 2) & (gx < 10)
+    fine = int(round(32.0 / step_um))
+    step_px = step_um / MPP
+    gy, gx = np.mgrid[0 : NY * fine, 0 : NX * fine]
+    on = (gx >= 2 * fine) & (gx < 10 * fine)
     for i in range(n_sections):
         rows.append(f"{i},s{i}.czi,/cluster/s{i}.czi")
         if i in skip:
             continue
-        cx = ((gx + 0.5) * STEP)[on].astype(int)
-        cy = ((gy + 0.5) * STEP)[on].astype(int)
+        cx = ((gx + 0.5) * step_px)[on].astype(int)
+        cy = ((gy + 0.5) * step_px)[on].astype(int)
         df = pd.DataFrame({"cx_px": cx, "cy_px": cy, "x0_px": cx - 112, "y0_px": cy - 112})
         for col, p in zip(prob_columns(CLASSES), rng.dirichlet([1, 2, 0.3, 1], len(cx)).T):
             df[col] = p
@@ -49,6 +55,8 @@ def _fake_run(tmp_path, n_sections, *, stride=1, skip=()):
             "n_tiles": len(df),
             "tissue_frac": float(on.mean()),
             "stride": stride,
+            "tile_um": 32.0,
+            "step_um": step_um,
         }
         (tiles_dir / f"{i:04d}_meta.json").write_text(json.dumps(meta))
     manifest = tmp_path / "manifest.csv"
@@ -134,6 +142,61 @@ class TestRunDirectory:
         _build(manifest, out, smooth_um=64.0)
         meta = json.loads((out / "volume_build_metadata.json").read_text())
         assert meta["smooth_um"] == 64.0
+
+
+class TestFinerStep:
+    """8 um tile centres from 8 um sections: 8 um cubes, one slice per section."""
+
+    def test_step_8_gives_8um_cubes_per_section(self, tmp_path):
+        manifest, out = _fake_run(tmp_path, 3, step_um=8.0)
+        zarr_path = build_niche_run(
+            manifest, out / "no_registered", out,
+            z_spacing_um=8.0, step_um=8.0, predict=False,
+        )
+        assert zarr_path.name == "volume_niches_8um.zarr"
+
+        import spatialdata
+
+        sdata = spatialdata.read_zarr(str(zarr_path))
+        assert sdata.labels["tissue_labels"].shape == (3, NY * 4, NX * 4)
+        assert sdata.attrs["niche_voxel_um_zyx"] == [8.0, 8.0, 8.0]
+        meta = json.loads((out / "volume_build_metadata.json").read_text())
+        assert meta["step_um"] == 8.0 and meta["voxel_um"] == 8.0
+        assert meta["sections_per_voxel"] == 1 and meta["dropped_sections"] == []
+
+    def test_32um_tiles_are_not_reused_for_an_8um_run(self, tmp_path):
+        manifest, out = _fake_run(tmp_path, 2, step_um=32.0)
+        with pytest.raises(ValueError, match="tile step"):
+            predict_sections(
+                manifest, tmp_path / "registered", out / "niches", step_um=8.0
+            )
+
+
+class TestJobArray:
+    def test_tasks_split_the_stack_interleaved(self, tmp_path, monkeypatch):
+        manifest, out = _fake_run(tmp_path, 10)
+        seen = {}
+
+        def fake_run(*args, **kwargs):
+            seen["indices"] = kwargs["section_indices"]
+            seen["build"] = kwargs["build"]
+
+        monkeypatch.setattr("path3d.niches.run.build_niche_run", fake_run)
+        main([
+            "--manifest", str(manifest), "--registered", "r", "--out", str(out),
+            "--z-spacing-um", "8", "--predict-only",
+            "--task-index", "1", "--task-count", "4",
+        ])
+        assert seen == {"indices": [1, 5, 9], "build": False}
+
+    def test_predict_only_subset_touches_only_its_sections(self, tmp_path):
+        """Sections outside the task are not even looked at."""
+        manifest, out = _fake_run(tmp_path, 4, skip={0, 1, 2, 3})
+        # No registered files exist; a task over [] must not warn about them.
+        metas = predict_sections(
+            manifest, tmp_path / "registered", out / "niches", section_indices=[]
+        )
+        assert metas == {}
 
 
 class TestMissingSections:

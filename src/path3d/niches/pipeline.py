@@ -27,6 +27,7 @@ level off the same file and you only pay for one warp.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -62,6 +63,8 @@ def predict_sections(
     mask_level: int = 4,
     limit: int = 0,
     stride: int = 1,
+    step_um: float | None = None,
+    section_indices: Iterable[int] | None = None,
     device: str | None = None,
     skip_existing: bool = True,
     cache_embeddings: bool = True,
@@ -87,9 +90,14 @@ def predict_sections(
         limit: cap tiles per section (debugging only).
         stride: keep every ``stride``-th grid cell in each axis -- a fast
             full-extent preview of the whole stack at 1/stride^2 the cost.
+        step_um: spacing between tile centres, microns; the model's own
+            ``tile_um`` (32) when None. See :func:`predict.predict_slide`.
+        section_indices: predict only these manifest rows (0-based), e.g. one
+            job-array task's share of the stack. None predicts every row.
         device: torch device override.
         skip_existing: reuse a section's CSV if it is already on disk. Raises
-            if that CSV was predicted with a different ``stride``.
+            if that CSV was predicted with a different ``stride`` or
+            ``step_um``.
         cache_embeddings: checkpoint each section's UNI2-h embeddings to
             ``output_dir/embeddings/{idx:04d}.npz``. Costs ~75 MB per 25 000
             tiles and makes an interrupted section resume mid-way rather than
@@ -112,10 +120,15 @@ def predict_sections(
     if not isinstance(model, NicheModel):
         model = load_model(model)
 
+    step = float(step_um) if step_um is not None else model.tile_um
+    wanted = set(range(len(paths))) if section_indices is None else set(section_indices)
+
     encoder = None
     metas: dict[str, dict] = {}
 
     for index, path in enumerate(paths):
+        if index not in wanted:
+            continue
         registered = registered_path_for(registered_dir, index)
         csv_path = tiles_dir / f"{index:04d}_tiles_niches.csv"
         meta_path = tiles_dir / f"{index:04d}_meta.json"
@@ -131,6 +144,15 @@ def predict_sections(
                     f"{cached.get('stride', 1)}, but this run asks for stride "
                     f"{stride}. Write previews and full runs to different "
                     f"output directories."
+                )
+            # Same for the tile step: 32 um tiles rasterised on an 8 um grid
+            # fill one cell in sixteen.
+            cached_step = float(cached.get("step_um", cached.get("tile_um", step)))
+            if abs(cached_step - step) > 1e-9:
+                raise ValueError(
+                    f"{csv_path} was predicted with a {cached_step:g} um tile "
+                    f"step, but this run asks for {step:g} um. Write runs with "
+                    f"different steps to different output directories."
                 )
             metas[str(path)] = cached
             if verbose:
@@ -160,6 +182,7 @@ def predict_sections(
                 mask_level=mask_level,
                 limit=limit,
                 stride=stride,
+                step_um=step,
                 encoder=encoder,
                 cache_path=(
                     embeddings_dir / f"{index:04d}.npz" if cache_embeddings else None

@@ -6,24 +6,31 @@ Mirrors the layout of a ``pipeline.run_pipeline`` + ``rebuild_volume`` run
     OUT/
       manifest_thickness_8um.csv    manifest + the z spacing actually used
       volume_build_metadata.json    every parameter, plus per-section status
-      label_maps/NNNN_labels.png    per-section argmax, 32 um grid, uint8
+      label_maps/NNNN_labels.png    per-section argmax on the tile grid, uint8
       label_maps/NNNN_labels_rgb.png   same, in the HGSC_niches palette
       quantification/soft_volumetrics.csv    per-class volume from probabilities
       quantification/per_section_profile.csv per-section area, for QC
-      volume_niches_32um.zarr       labels["tissue_labels"] + images["niche_probabilities"]
+      volume_niches_8um.zarr        labels["tissue_labels"] + images["niche_probabilities"]
                                     (+ tables["nuclei"] with --nuclei-parquet)
       niches/tiles/                 per-section tile CSVs (the model output)
       niches/embeddings/            UNI2-h checkpoints (resume + free re-scoring)
 
+``--step-um`` sets the spacing of tile centres, and with it the in-plane
+voxel size; the voxel cube defaults to the same. 8 um from 8 um sections gives
+one voxel per section per 8 um tile, on the same grid as an 8 um
+``volume.build_volume`` volume. Each tile still sees the model's 112 um
+window, so a finer step locates boundaries more finely but does not resolve
+structure below that scale.
+
 Prediction is the only expensive step and is resumable per section, so on a
-cluster just resubmit the same command after a walltime kill. Everything after
-it runs in about a minute from ``niches/tiles`` alone -- pass
-``--skip-predict`` to rebuild the volume (e.g. with different smoothing)
-without a GPU.
+cluster just resubmit the same command after a walltime kill. It can also be
+split across GPUs: ``--predict-only --task-index I --task-count N`` predicts
+every N-th section starting at I, and a final ``--skip-predict`` call builds
+the volume from ``niches/tiles`` without a GPU.
 
     python -m path3d.niches.run \\
         --manifest manifest_hpc.csv --registered RUN/registered --out OUT \\
-        --z-spacing-um 8 --voxel-um 32 \\
+        --z-spacing-um 8 --step-um 8 \\
         --nuclei-parquet full_volume_dpt/nuclei_dpt_8um.parquet
 """
 
@@ -89,8 +96,8 @@ def build_niche_run(
     out_dir: str | Path,
     *,
     z_spacing_um: float,
-    voxel_um: float = 32.0,
-    grid_um: float = 32.0,
+    step_um: float | None = None,
+    voxel_um: float | None = None,
     smooth_um: float = 0.0,
     smooth_z_sigma: float = 0.0,
     quantile: float = 0.80,
@@ -101,8 +108,10 @@ def build_niche_run(
     nuclei_parquet: str | Path | None = None,
     allow_missing: bool = False,
     predict: bool = True,
+    build: bool = True,
+    section_indices: list[int] | None = None,
     tag: str = "niches",
-) -> Path:
+) -> Path | None:
     """Predict every section, then write the full run directory.
 
     Args:
@@ -110,9 +119,11 @@ def build_niche_run(
         registered_dir: the registered ``NNNN.ome.tiff`` sections.
         out_dir: run directory to write (see the module docstring).
         z_spacing_um: microns between consecutive manifest rows.
-        voxel_um: cube size of the saved volume. Must be a whole multiple of
-            ``z_spacing_um``; that many sections are averaged per voxel.
-        grid_um: in-plane rasterisation grid, microns.
+        step_um: spacing between tile centres, which is also the in-plane
+            grid. The model's own ``tile_um`` (32) when None.
+        voxel_um: cube size of the saved volume; ``step_um`` when None. Must
+            be a whole multiple of ``z_spacing_um`` (that many sections are
+            averaged per voxel) and no coarser than ``step_um``.
         smooth_um, smooth_z_sigma: see :func:`build_niche_volume`.
         quantile, mask_level, stride, device, cache_embeddings: see
             :func:`predict_sections`.
@@ -124,10 +135,12 @@ def build_niche_run(
             them empty. Off by default: a missing section is usually a job
             that has not finished, not a blank slide.
         predict: False skips prediction and builds from ``niches/tiles`` only.
+        build: False stops after prediction -- one job-array task's share.
+        section_indices: predict only these manifest rows; None predicts all.
         tag: volume name, ``volume_{tag}_{voxel_um}um.zarr``.
 
     Returns:
-        Path of the written zarr.
+        Path of the written zarr, or None when ``build`` is False.
 
     Raises:
         RuntimeError: sections have no prediction and ``allow_missing`` is
@@ -140,6 +153,8 @@ def build_niche_run(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     model = load_model()
+    grid_um = float(step_um) if step_um is not None else model.tile_um
+    voxel_um = float(voxel_um) if voxel_um is not None else grid_um
     if predict:
         predict_sections(
             manifest_csv,
@@ -149,9 +164,13 @@ def build_niche_run(
             quantile=quantile,
             mask_level=mask_level,
             stride=stride,
+            step_um=grid_um,
+            section_indices=section_indices,
             device=device,
             cache_embeddings=cache_embeddings,
         )
+    if not build:
+        return None
 
     paths = load_manifest(manifest_csv)
     sections = load_sections(
@@ -184,7 +203,7 @@ def build_niche_run(
         )
 
     # Native (z_spacing, grid, grid) volume: one slice per section, for the
-    # per-section label maps and QC profile. Not written.
+    # per-section label maps and QC profile.
     native = build_niche_volume(
         manifest_csv,
         sections,
@@ -196,16 +215,22 @@ def build_niche_run(
     quant_dir = out_dir / "quantification"
     quant_dir.mkdir(parents=True, exist_ok=True)
     per_section_profile(native).to_csv(quant_dir / "per_section_profile.csv", index=False)
-    del native
 
-    cube = build_niche_volume(
-        manifest_csv,
-        sections,
-        z_spacing_um=z_spacing_um,
-        smooth_um=smooth_um,
-        smooth_z_sigma=smooth_z_sigma,
-        target_voxel_um=voxel_um,
-    )
+    if voxel_um == z_spacing_um == grid_um:
+        # Already cubic: the native volume IS the cube. At 8 um it is ~7 GB of
+        # probabilities, so building it a second time is not free.
+        cube = native
+    else:
+        del native
+        cube = build_niche_volume(
+            manifest_csv,
+            sections,
+            z_spacing_um=z_spacing_um,
+            smooth_um=smooth_um,
+            smooth_z_sigma=smooth_z_sigma,
+            target_voxel_um=voxel_um,
+        )
+    del sections
     dropped = list(cube.attrs["niche_dropped_sections"])
     volumetrics = soft_volumetrics(cube, csv_path=quant_dir / "soft_volumetrics.csv")
 
@@ -257,6 +282,7 @@ def build_niche_run(
             "fov_um": model.fov_um,
         },
         "registered_mpp": mpps,
+        "step_um": grid_um,
         "grid_um": grid_um,
         "z_spacing_um": z_spacing_um,
         "voxel_um": voxel_um,
@@ -296,10 +322,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--out", required=True, help="run directory to write")
     ap.add_argument("--z-spacing-um", type=float, required=True,
                     help="microns between consecutive manifest rows")
-    ap.add_argument("--voxel-um", type=float, default=32.0,
-                    help="cube size; a whole multiple of --z-spacing-um (default 32)")
-    ap.add_argument("--grid-um", type=float, default=32.0,
-                    help="in-plane grid (default 32, the model's tile size)")
+    ap.add_argument("--step-um", type=float, default=None,
+                    help="spacing of tile centres = in-plane grid "
+                    "(default 32, the model's tile size)")
+    ap.add_argument("--voxel-um", type=float, default=None,
+                    help="cube size; a whole multiple of --z-spacing-um "
+                    "(default: --step-um)")
     ap.add_argument("--smooth-um", type=float, default=0.0,
                     help="in-plane Gaussian sigma in microns (default 0, off)")
     ap.add_argument("--smooth-z-sigma", type=float, default=0.0,
@@ -316,16 +344,35 @@ def main(argv: list[str] | None = None) -> int:
                     help="build even if some sections have no prediction")
     ap.add_argument("--skip-predict", action="store_true",
                     help="build from existing niches/tiles only (no GPU)")
+    ap.add_argument("--predict-only", action="store_true",
+                    help="predict, then stop without building the volume")
+    ap.add_argument("--task-index", type=int, default=None,
+                    help="job-array task: predict sections I, I+N, I+2N, ...")
+    ap.add_argument("--task-count", type=int, default=None,
+                    help="job-array size N (with --task-index)")
     ap.add_argument("--tag", default="niches", help="volume_{tag}_{voxel}um.zarr")
     a = ap.parse_args(argv)
+
+    section_indices = None
+    if (a.task_index is None) != (a.task_count is None):
+        ap.error("--task-index and --task-count go together")
+    if a.task_index is not None:
+        if not 0 <= a.task_index < a.task_count:
+            ap.error(f"--task-index must be in [0, {a.task_count})")
+        n = len(load_manifest(a.manifest))
+        # Interleaved rather than contiguous blocks: tissue area drifts along
+        # z, so every task gets a share of the big and the small sections.
+        section_indices = list(range(a.task_index, n, a.task_count))
+        print(f"task {a.task_index}/{a.task_count}: sections {section_indices}",
+              flush=True)
 
     build_niche_run(
         a.manifest,
         a.registered,
         a.out,
         z_spacing_um=a.z_spacing_um,
+        step_um=a.step_um,
         voxel_um=a.voxel_um,
-        grid_um=a.grid_um,
         smooth_um=a.smooth_um,
         smooth_z_sigma=a.smooth_z_sigma,
         quantile=a.quantile,
@@ -336,6 +383,8 @@ def main(argv: list[str] | None = None) -> int:
         nuclei_parquet=a.nuclei_parquet,
         allow_missing=a.allow_missing,
         predict=not a.skip_predict,
+        build=not a.predict_only,
+        section_indices=section_indices,
         tag=a.tag,
     )
     return 0

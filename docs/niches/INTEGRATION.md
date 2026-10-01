@@ -45,7 +45,7 @@ only the section in flight; re-running skips what is already on disk.
 of a `run_pipeline` + volume-build run (`full_volume_dpt/`):
 
 ```
-OUT/volume_niches_32um.zarr       labels + probabilities (+ nuclei)
+OUT/volume_niches_8um.zarr        labels + probabilities (+ nuclei)
 OUT/label_maps/NNNN_labels{,_rgb}.png
 OUT/quantification/soft_volumetrics.csv, per_section_profile.csv
 OUT/manifest_thickness_8um.csv
@@ -53,22 +53,49 @@ OUT/volume_build_metadata.json
 OUT/niches/{tiles,embeddings}/
 ```
 
-On the cluster, from the repo root, inside the path3d Apptainer image:
+### Tile step: finer real sampling
+
+`--step-um` spaces the tile centres, and the in-plane voxel follows it. The
+model's own tile size is 32 µm. At `--step-um 8` a centre sits every 8 µm, so
+with 8 µm sections the volume is 8 µm cubes, one slice per section, on the
+same grid as an 8 µm `volume.build_volume` volume. Every centre still gets the
+full 112 µm window, so neighbouring windows overlap by 104 µm. That places
+class boundaries on a finer grid from real predictions rather than
+interpolation, but the model cannot resolve structure much below its window.
+It costs the square of the refinement: 8 µm is 16× the tiles of 32 µm, about
+400 000 per section here, roughly an hour each on an H100. The embedding cache
+grows the same way, to ~1.2 GB per section.
+
+### On the cluster
+
+From the repo root, inside the path3d Apptainer image. The default is an 8 µm
+step, split across a 10-task GPU job array, with a CPU job that builds the
+volume once the array has ended:
 
 ```bash
 mkdir -p $SCRATCH/path3d_niches/logs   # outputs land in $SCRATCH/path3d_niches too
-SIF=/path/to/path3d.sif STRIDE=4 sbatch scripts/build_niche_volume.sh   # preview
-SIF=/path/to/path3d.sif sbatch scripts/build_niche_volume.sh            # full run
+SIF=/path/to/path3d.sif STRIDE=4 bash scripts/submit_niche_volume.sh   # preview
+SIF=/path/to/path3d.sif bash scripts/submit_niche_volume.sh            # full run
+SIF=/path/to/path3d.sif TASKS=3,7 bash scripts/submit_niche_volume.sh  # redo tasks
 ```
 
+Task *i* of *N* predicts manifest rows *i*, *i+N*, …, interleaved, so every
+task gets a similar mix of large and small sections. The build job uses
+`afterany`, so it runs even if a task failed, and then refuses to build,
+naming the missing sections. Resubmit those tasks with `TASKS=`: finished
+sections are skipped, and a half-done one resumes from its embedding
+checkpoint. `STEP_UM=32` reproduces the original 32 µm run. Runs with
+different steps go to different directories, and a run refuses tiles
+predicted at another step.
+
 The job bind-mounts the checkout over the image's copy of path3d, so a
-`git pull` takes effect without rebuilding the image. Resubmit it after a
-walltime kill. Everything after prediction runs from `niches/tiles` alone, so
-`--skip-predict` rebuilds the volume without a GPU.
-`--nuclei-parquet full_volume_dpt/nuclei_dpt_8um.parquet` attaches the same
-nuclei the DPT volume carries. View the result with
-`python scripts/view_volume.py OUT/volume_niches_32um.zarr`; it detects a niche
-volume and uses the `HGSC_niches` palette.
+`git pull` takes effect without rebuilding the image. Everything after
+prediction runs from `niches/tiles` alone, so `--skip-predict` rebuilds the
+volume without a GPU. `--nuclei-parquet full_volume_dpt/nuclei_dpt_8um.parquet`
+attaches the same nuclei the DPT volume carries. View the result with
+`python scripts/view_volume.py OUT/volume_niches_8um.zarr`. It detects a niche
+volume and uses the `HGSC_niches` palette. A coarser niche volume, such as
+32 µm, is drawn smoothed to 8 µm for display unless you pass `--raw`.
 
 ## Run the model on the registered sections, not the raw slides
 

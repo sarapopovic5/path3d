@@ -18,6 +18,11 @@ The palette and class names are picked from the volume itself: a niche volume
 attributes and opens as ``HGSC_niches``; anything else opens as ``HGSC``.
 Pass a tissue type as a second argument to override.
 
+A niche volume coarser than 8 um (e.g. 32 um cubes) is shown smoothed: its
+probabilities are interpolated to 8 um cubes and argmaxed, in memory, for
+display only (nothing is written). Add ``--raw`` to see the stored cubes. An
+8 um volume is shown as stored.
+
 Requires psutil (``pip install path3d[viz]`` does not pull it in; ``pip
 install psutil``).
 """
@@ -38,6 +43,10 @@ from path3d.visualization import view_volume
 TRACE = Path("rss_trace.csv")
 INTERVAL = 0.1
 PEAK_REPORT_STEP = 0.25  # GiB -- print a live line each time the peak grows this much
+# Niche volumes coarser than this are drawn at it (32 um -> 8 um), interpolated
+# from their probabilities. Volumes already this fine are shown as stored, as
+# are all volumes with --raw.
+DISPLAY_UM = 8.0
 
 _PROC = psutil.Process()
 _T0 = time.monotonic()
@@ -121,19 +130,94 @@ def tissue_type_of(path: str | Path) -> str:
     return "HGSC_niches" if "niche_classes" in attrs else "HGSC"
 
 
+def _smooth_niche_labels(sdata, factor: int):
+    """Redraw a niche volume's labels on a ``factor``x finer grid, smoothly.
+
+    Interpolates ``images["niche_probabilities"]`` trilinearly -- NaN-aware,
+    so off-tissue never bleeds in -- then takes the argmax per fine voxel.
+    For display only: it is the same prediction with smooth boundaries
+    instead of 32 um blocks, and it is never written anywhere.
+
+    Coordinates are centre-aligned: fine index ``i`` samples coarse position
+    ``(i + 0.5) / factor - 0.5``, which is where ``skimage.transform.resize``
+    puts pixel centres, so z and in-plane agree.
+    """
+    import numpy as np
+    from skimage.transform import resize
+    from spatialdata import SpatialData
+    from spatialdata.models import Labels3DModel
+    from spatialdata.transformations import Affine, get_transformation
+
+    from path3d.niches.rasterize import argmax_labels
+
+    element = sdata.images["niche_probabilities"]
+    probs = np.asarray(element.data, dtype=np.float32)  # (c, z, y, x)
+    classes = [str(c) for c in element.coords["c"].values]
+    n_classes, nz, ny, nx = probs.shape
+    valid = np.isfinite(probs).all(axis=0)
+    filled = np.where(valid, probs, 0.0).astype(np.float32)
+    voxel_um = float(
+        get_transformation(element, "microns_3d").to_affine_matrix(
+            input_axes=("z", "y", "x"), output_axes=("z", "y", "x")
+        )[0, 0]
+    )
+
+    out_hw = (ny * factor, nx * factor)
+
+    def up(plane):
+        return resize(plane, out_hw, order=1, mode="edge",
+                      anti_aliasing=False, preserve_range=True).astype(np.float32)
+
+    labels = np.zeros((nz * factor, *out_hw), np.uint8)
+    for i in range(nz * factor):
+        c = min(max((i + 0.5) / factor - 0.5, 0.0), nz - 1.0)
+        lo = int(np.floor(c))
+        hi = min(lo + 1, nz - 1)
+        t = c - lo
+        weight = up((1 - t) * valid[lo] + t * valid[hi])
+        plane = np.empty((n_classes, *out_hw), np.float32)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            for k in range(n_classes):
+                plane[k] = up((1 - t) * filled[k, lo] + t * filled[k, hi]) / weight
+        plane[:, weight < 0.5] = np.nan
+        labels[i] = argmax_labels(plane, classes)
+
+    fine_um = voxel_um / factor
+    affine = Affine(np.diag([fine_um, fine_um, fine_um, 1.0]),
+                    input_axes=("z", "y", "x"), output_axes=("z", "y", "x"))
+    labels_el = Labels3DModel.parse(
+        labels, dims=("z", "y", "x"), transformations={"microns_3d": affine}
+    ).chunk({"z": 1, "y": 512, "x": 512})
+    print(f"smoothed display: {voxel_um:g} um -> {fine_um:g} um cubes, "
+          f"shape {labels.shape}", flush=True)
+    return SpatialData(labels={"tissue_labels": labels_el}, tables=dict(sdata.tables))
+
+
 def main() -> None:
-    if len(sys.argv) < 2:
-        sys.exit("usage: python scripts/view_volume.py VOLUME.zarr [TISSUE_TYPE]")
-    path = sys.argv[1]
-    tissue_type = sys.argv[2] if len(sys.argv) > 2 else tissue_type_of(path)
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    raw = "--raw" in sys.argv
+    if not args:
+        sys.exit("usage: python scripts/view_volume.py VOLUME.zarr [TISSUE_TYPE] [--raw]")
+    path = args[0]
+    tissue_type = args[1] if len(args) > 1 else tissue_type_of(path)
     print(f"tissue type: {tissue_type}", flush=True)
 
     with TRACE.open("w") as fh:
         fh.write("t_s,rss_gib,avail_gib,stage\n")
         threading.Thread(target=_sampler, args=(fh,), daemon=True).start()
         try:
+            volume = path
+            if tissue_type == "HGSC_niches" and not raw:
+                import spatialdata
+
+                stage("01a smooth niche labels")
+                sdata = spatialdata.read_zarr(path)
+                voxel_um = sdata.attrs.get("niche_voxel_um_zyx", [DISPLAY_UM])[0]
+                factor = int(round(voxel_um / DISPLAY_UM))
+                if factor > 1 and "niche_probabilities" in sdata.images:
+                    volume = _smooth_niche_labels(sdata, factor)
             stage("01 view_volume (read_zarr + layers)")
-            view_volume(path, tissue_type=tissue_type)
+            view_volume(volume, tissue_type=tissue_type)
 
             # Blocks until the window is closed. Rotating/zooming and toggling
             # the hidden class_ layers happens inside this stage, so the live
