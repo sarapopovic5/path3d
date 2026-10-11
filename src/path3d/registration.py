@@ -48,6 +48,7 @@ def register(
     section_thickness_um: float = 12.0,
     image_key_pattern: str = "section_{:04d}",
     normalizer=None,
+    non_rigid_mask: str = "tissue",
 ) -> dict[int, object]:
     """Register a section stack with VALIS using CPU-only ORB matching.
 
@@ -68,6 +69,16 @@ def register(
                               (e.g. ``"section_{:04d}"``).
         normalizer:           Optional fitted TorchMacenkoNormalizer; when given,
                               each section PNG is stain-normalised before VALIS sees it.
+        non_rigid_mask:       Region the elastic field is estimated in.
+                              ``"tissue"`` (default): bounding box of the tissue
+                              present in at least 2 rigidly aligned sections
+                              (``_tissue_bbox_mask``). ``"overlap"``: VALIS's
+                              own box for ``create_masks=False``, the region
+                              where EVERY section's image footprint overlaps;
+                              on the pilot it held about half the tissue, left
+                              the rest rigid-only and put seams through the
+                              volume at its edges. The rigid step is the same
+                              for both.
 
     Returns:
         dict mapping section_index → VALIS slide object. Use slide.warp_xy()
@@ -76,7 +87,13 @@ def register(
     Raises:
         ImportError:  valis-wsi not installed.
         RuntimeError: VALIS completed but produced no transforms.
+        ValueError:   unknown ``non_rigid_mask``.
     """
+    if non_rigid_mask not in ("tissue", "overlap"):
+        raise ValueError(
+            f"non_rigid_mask must be 'tissue' or 'overlap', got {non_rigid_mask!r}"
+        )
+
     try:
         from valis import registration
     except ImportError as exc:
@@ -127,7 +144,10 @@ def register(
     )
 
     nr_cls = registration.DEFAULT_NON_RIGID_CLASS if do_non_rigid else None
-    registrar = registration.Valis(
+    valis_cls = (
+        _tissue_mask_valis_cls() if non_rigid_mask == "tissue" else registration.Valis
+    )
+    registrar = valis_cls(
         str(img_dir),
         str(output_dir),
         img_list=png_paths,
@@ -652,6 +672,107 @@ def attach_transforms(
 
 
 # Internal helpers
+
+def _tissue_bbox_mask(
+    slides: list[Any],
+    shape_rc: tuple[int, int],
+    *,
+    gray_threshold: float = cfg.TISSUE_GRAY_THRESHOLD,
+    min_sections: int = 2,
+    pad_frac: float = 0.02,
+) -> np.ndarray:
+    """Non-rigid registration mask: bounding box of the tissue present in at
+    least ``min_sections`` rigidly aligned sections, padded by ``pad_frac``.
+
+    Tissue is gray < ``gray_threshold`` (and not black fill) on each VALIS
+    slide image, lightly opened to drop specks, then rigidly warped into the
+    reference frame. Requiring 2 sections ignores debris seen only once.
+
+    Args:
+        slides: VALIS slide objects (``.image``, ``.processed_img_shape_rc``,
+            ``.warp_img``).
+        shape_rc: the reference slide's ``reg_img_shape_rc``.
+
+    Returns:
+        (rows, cols) uint8 mask, 255 inside the box. The full frame when no
+        tissue is found.
+    """
+    from scipy import ndimage
+    from skimage.color import rgb2gray
+
+    counts = np.zeros(shape_rc, dtype=np.int32)
+    for slide in slides:
+        img = np.asarray(slide.image)
+        if img.ndim == 3:
+            gray = rgb2gray(img[..., :3])
+        else:
+            gray = img.astype(float) / max(1.0, float(img.max()))
+        tissue = ndimage.binary_opening((gray < gray_threshold) & (gray > 0.02), iterations=2)
+        tissue = resize(
+            tissue, slide.processed_img_shape_rc, order=0, anti_aliasing=False,
+        )
+        warped = slide.warp_img(
+            255 * tissue.astype(np.uint8), non_rigid=False, crop=False,
+            interp_method="nearest",
+        )
+        counts[np.asarray(warped) > 0] += 1
+
+    rows, cols = np.nonzero(counts >= min_sections)
+    mask = np.zeros(shape_rc, dtype=np.uint8)
+    if rows.size == 0:
+        mask[:] = 255
+        return mask
+    pad_r = int(pad_frac * shape_rc[0]) + 2
+    pad_c = int(pad_frac * shape_rc[1]) + 2
+    r0, r1 = max(0, rows.min() - pad_r), min(shape_rc[0], rows.max() + 1 + pad_r)
+    c0, c1 = max(0, cols.min() - pad_c), min(shape_rc[1], cols.max() + 1 + pad_c)
+    mask[r0:r1, c0:c1] = 255
+    return mask
+
+
+_valis_subclasses: dict[str, type] = {}
+
+
+def _tissue_mask_valis_cls() -> type:
+    """``valis.registration.Valis`` with ``create_non_rigid_reg_mask`` replaced
+    by ``_tissue_bbox_mask``; everything else, rigid step included, unchanged.
+
+    Built on first use because importing valis is slow. It is reachable as
+    this module's ``_TissueMaskValis`` (see ``__getattr__``), so the registrar
+    VALIS pickles at the end of ``registrar.register()`` can be loaded again
+    in a new process.
+    """
+    if "_TissueMaskValis" not in _valis_subclasses:
+        from valis import registration as _valis_reg
+
+        class _TissueMaskValis(_valis_reg.Valis):
+            def create_non_rigid_reg_mask(self):
+                slides = list(self.slide_dict.values())
+                shape_rc = tuple(self.get_ref_slide().reg_img_shape_rc)
+                mask = _tissue_bbox_mask(slides, shape_rc)
+                for slide in slides:
+                    slide.non_rigid_reg_mask = mask
+
+                from PIL import Image as _PIL
+                Path(self.mask_dir).mkdir(parents=True, exist_ok=True)
+                _PIL.fromarray(mask).save(
+                    Path(self.mask_dir) / f"{self.name}_non_rigid_mask_tissue.png"
+                )
+                print(f"[VALIS-CPU 2/3] Non-rigid mask: tissue bounding box, "
+                      f"{(mask > 0).mean():.0%} of the reference frame")
+
+        # defined in a function, but pickled by its module-level name
+        _TissueMaskValis.__qualname__ = "_TissueMaskValis"
+        _valis_subclasses["_TissueMaskValis"] = _TissueMaskValis
+    return _valis_subclasses["_TissueMaskValis"]
+
+
+def __getattr__(name: str):
+    # pickle looks the registrar's class up by name; build it on demand.
+    if name == "_TissueMaskValis":
+        return _tissue_mask_valis_cls()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def _valis_quiet_tqdm(iterable=None, *args, desc=None, total=None, **kwargs):
     """change VALIS tqdm's to quiet_progress
