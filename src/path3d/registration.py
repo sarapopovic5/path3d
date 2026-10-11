@@ -59,8 +59,7 @@ def register(
         output_dir:           VALIS output directory (thumbnails, logs). Created if absent.
         elastic_mpp:          Resolution for PNG export and elastic registration (µm/px).
         do_non_rigid:         Run elastic refinement after rigid pass.
-        artifact_masks:       section_index → bool mask (True=artifact). Ignored when
-                              do_non_rigid=False.
+        artifact_masks:       Not implemented; must be None.
         sdata:                Optional SpatialData container. When provided,
                               ``attach_transforms()`` is called automatically so each
                               section's rigid transform is stored under ``microns_3d``.
@@ -68,8 +67,8 @@ def register(
                               ``microns_3d`` (z = section_index * thickness).
         image_key_pattern:    Format string for image keys already loaded in sdata
                               (e.g. ``"section_{:04d}"``).
-        normalizer:           Optional fitted TorchMacenkoNormalizer; when given,
-                              each section PNG is stain-normalised before VALIS sees it.
+        normalizer:           Not implemented; must be None (VALIS registers the
+                              raw ``elastic_mpp`` PNGs).
         non_rigid_mask:       Region the elastic field is estimated in.
                               ``"tissue"`` (default): bounding box of the tissue
                               present in at least 2 rigidly aligned sections
@@ -89,7 +88,15 @@ def register(
         ImportError:  valis-wsi not installed.
         RuntimeError: VALIS completed but produced no transforms.
         ValueError:   unknown ``non_rigid_mask``.
+        NotImplementedError: ``normalizer`` or ``artifact_masks`` is given.
     """
+    if normalizer is not None or artifact_masks is not None:
+        # Both were documented but never wired in; fail instead of silently
+        # registering un-normalised, unmasked images.
+        raise NotImplementedError(
+            "register(): normalizer and artifact_masks are not implemented; "
+            "pass None."
+        )
     if non_rigid_mask not in ("tissue", "overlap"):
         raise ValueError(
             f"non_rigid_mask must be 'tissue' or 'overlap', got {non_rigid_mask!r}"
