@@ -17,6 +17,13 @@ import numpy as np
 SEG_MPP = 0.5   # segmentation and nuclear-detection working resolution, um/px
 REG_MPP = 8.0   # elastic serial-section registration resolution, um/px
 
+# Resolution the segmentation checkpoints were TRAINED at. Every patch in
+# training_data_v2's patch_manifest.csv has downsample=2.0 from CZIs whose
+# level 0 is ~0.2201 um/px, i.e. 448 px patches at ~0.4402 um/px (~197 um
+# field of view). predict_section sizes its tiles so the encoder sees this
+# same um/px; change it if a model is retrained at another resolution.
+SEG_TRAIN_MPP = 0.4402
+
 # Fixed grayscale cutoff for preprocessing.make_tissue_mask, in [0, 1] on an
 # rgb2gray float image (True = background when gray > threshold). Replaces a
 # per-image Otsu fit that was measured flipping to a non-blob (precise) mask
