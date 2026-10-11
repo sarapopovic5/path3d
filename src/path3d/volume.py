@@ -9,9 +9,12 @@ warped/registered. Output: ``(z, y, x)`` uint8 volume at ``target_voxel_um``
 isotropic, in microns. Z order follows manifest CSV row order, never
 filename sorting.
 
-Deliberate divergences: (1) rigid-only, elastic fields are not baked in;
-(2) label z-pitch is always uniform ``target_voxel_um``; variable
-``thickness_um`` applies to nuclear z only.
+Deliberate divergences: (1) nuclei use the full VALIS warp (rigid +
+elastic) when their table carries ``reg_y_um``/``reg_x_um``, which
+``pipeline.run_pipeline`` writes; tables without them fall back to the
+section's rigid Affine, which omits the elastic field; (2) label z-pitch is
+always uniform ``target_voxel_um``; variable ``thickness_um`` applies to
+nuclear z only.
 """
 
 from __future__ import annotations
@@ -26,6 +29,11 @@ from path3d.slide_io import load_manifest, load_manifest_thickness
 
 if TYPE_CHECKING:
     from spatialdata.transformations import Affine
+
+
+# Nuclear-table columns holding centroids already warped into the registered
+# canvas (microns), written by pipeline.run_pipeline.
+_REGISTERED_COLUMNS = frozenset({"reg_y_um", "reg_x_um"})
 
 
 def _cumulative_z_from_thickness(
@@ -155,7 +163,7 @@ def build_volume(
     registration_mpp: float | None = None,
     output_path: str | Path | None = None,
     nuclear_parquet_path: str | Path | None = None,
-    smooth_z_sigma: float = 1.0,
+    smooth_z_sigma: float = 0.0,
 ):
     """Assemble per-section label maps (+ optional nuclear features) into one
     3D SpatialData container.
@@ -163,26 +171,37 @@ def build_volume(
     Section order/count come from ``load_manifest`` row order; z-index k =
     enumerate position k, label maps keyed by ``str(path)``. Label z-spacing
     is unconditionally ``target_voxel_um``, never ``thickness_um``. With
-    ``nuclear_features`` (``transforms``, ``level0_mpp``,
-    ``registration_mpp`` then required), centroids are mapped to microns via
-    the section's rigid Affine, z overridden with cumulative-thickness z,
-    and globally-unique instance IDs attached as ``tables["nuclei"]``.
-    Output is rechunked to ``(1, 512, 512)``.
+    ``nuclear_features``, each nucleus's in-plane position comes from its
+    table's ``reg_y_um``/``reg_x_um`` columns when present: centroids already
+    mapped through VALIS's rigid + elastic point warp
+    (``registration.warp_points_to_registered``), i.e. the transform the label
+    maps were warped with. Tables without those columns fall back to the
+    section's rigid Affine (``transforms``, ``level0_mpp`` and
+    ``registration_mpp`` then required), which omits the elastic field. z is
+    overridden with cumulative-thickness z, and globally-unique instance IDs
+    are attached as ``tables["nuclei"]``. Output is rechunked to
+    ``(1, 512, 512)``.
 
     Args:
         manifest_csv: manifest CSV (section_index, filename, path[, thickness_um]).
         label_maps: ``str(path)`` -> (H, W) integer label map, at ``section_mpp``.
-        transforms: ``str(path)`` -> full rigid Affine. Required with ``nuclear_features``.
-        nuclear_features: ``str(path)`` -> nuclear feature ``pd.DataFrame`` (level-0
+        transforms: ``str(path)`` -> full rigid Affine. Required when a
+            ``nuclear_features`` table lacks ``reg_y_um``/``reg_x_um``.
+        nuclear_features: ``str(path)`` -> nuclear feature ``pd.DataFrame``
+            (``reg_y_um``/``reg_x_um`` in the registered canvas, or level-0
             pixel centroids). Omit for no ``tables["nuclei"]``.
         target_voxel_um: isotropic output resolution, microns.
         section_mpp: input label-map resolution, microns per pixel.
         level0_mpp, registration_mpp: level-0 and Affine-fit resolutions, microns/px.
-            Both required with ``nuclear_features``.
+            Required with ``transforms``.
         output_path: if given, ``sdata.write()`` target.
         nuclear_parquet_path: if given, merged nuclear table written here.
-        smooth_z_sigma: pre-mapping Affine in-plane smoothing sigma; ``0.0``
-            disables. Unused without ``nuclear_features``.
+        smooth_z_sigma: in-plane smoothing sigma (in sections) applied to the
+            rigid Affines before mapping. Default ``0.0`` (off): adjacent
+            sections sit on their slides at very different angles, so
+            averaging their parameters gives transforms that belong to no
+            section, and the label maps are never smoothed. Only used on the
+            rigid-Affine fallback.
 
     Returns:
         ``SpatialData`` with ``labels["tissue_labels"]``, plus ``tables["nuclei"]``
@@ -191,8 +210,8 @@ def build_volume(
     Raises:
         ImportError: spatialdata (or anndata) is not installed.
         KeyError: a manifest path is missing from ``label_maps`` or ``nuclear_features``.
-        ValueError: ``nuclear_features`` given without ``transforms``, ``level0_mpp``,
-            or ``registration_mpp``.
+        ValueError: a ``nuclear_features`` table lacks ``reg_y_um``/``reg_x_um``
+            and ``transforms``, ``level0_mpp`` or ``registration_mpp`` is missing.
     """
     try:
         from spatialdata import SpatialData
@@ -252,14 +271,18 @@ def build_volume(
     tables: dict[str, object] = {}
 
     if nuclear_features is not None:
-        if transforms is None:
+        needs_affine = any(
+            not _REGISTERED_COLUMNS.issubset(df.columns)
+            for df in nuclear_features.values()
+        )
+        if needs_affine and transforms is None:
             raise ValueError(
                 "transforms must be provided when nuclear_features is "
                 "given -- nuclear centroids require the section's full "
                 "rigid Affine to reach microns_3d (RESEARCH.md Pitfall 2: "
                 "never the label's scale-only convention)."
             )
-        if level0_mpp is None or registration_mpp is None:
+        if needs_affine and (level0_mpp is None or registration_mpp is None):
             raise ValueError(
                 "level0_mpp and registration_mpp must both be provided "
                 "when nuclear_features is given -- required to rescale "
@@ -281,8 +304,9 @@ def build_volume(
         # from z-smoothed in-plane parameters when smooth_z_sigma > 0;
         # otherwise use transforms unchanged. Ordered by INTEGER section
         # index (enumerate(paths)), never by path string.
-        working_transforms = _smoothed_section_transforms(
-            paths, transforms, smooth_z_sigma
+        working_transforms = (
+            _smoothed_section_transforms(paths, transforms, smooth_z_sigma)
+            if needs_affine else {}
         )
 
         per_section_frames: dict[int, pd.DataFrame] = {}
@@ -295,10 +319,19 @@ def build_volume(
                     f"every manifest row when supplied."
                 )
             feats = nuclear_features[key]
-            centroids = feats[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float64)
-            zyx = _transform_centroids_to_microns(
-                centroids, working_transforms[key], level0_mpp, registration_mpp
-            )
+            if _REGISTERED_COLUMNS.issubset(feats.columns):
+                # Already in the registered canvas, through the same rigid +
+                # elastic warp as the label maps.
+                reg_yx = feats[["reg_y_um", "reg_x_um"]].to_numpy(dtype=np.float64)
+                zyx = np.column_stack([np.zeros(len(reg_yx)), reg_yx])
+            else:
+                # Rigid-only fallback: misses the elastic field the label maps
+                # were warped with, so nuclei can sit off their labels by the
+                # local elastic displacement.
+                centroids = feats[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float64)
+                zyx = _transform_centroids_to_microns(
+                    centroids, working_transforms[key], level0_mpp, registration_mpp
+                )
             # NUCLEAR z OVERRIDE: discard the affine-derived z (which comes
             # from registration.py's own z convention and need not equal
             # the manifest thickness) and write the cumulative-thickness

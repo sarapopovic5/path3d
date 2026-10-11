@@ -456,13 +456,7 @@ def warp_and_save_section(
 
     level = _source_level_for_mpp(reader, target_mpp)
 
-    # slide.aligned_slide_shape_rc is the level-0 (== reg_mpp) aligned canvas
-    # for this section; scaling it by reg_mpp/target_mpp puts every section
-    # on the same scaled canvas, which volume.build_volume's np.stack requires.
-    scale = reg_mpp / target_mpp
-    aligned_shape_rc = np.ceil(
-        np.asarray(slide.aligned_slide_shape_rc, dtype=float) * scale
-    ).astype(int)
+    aligned_shape_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
 
     crop_method = slide.get_crop_method(crop)
     bbox_xywh = None
@@ -513,6 +507,78 @@ def warp_and_save_section(
         )
 
     return dst_path
+
+
+def _registered_canvas_shape_rc(
+    slide: Any, reg_mpp: float, target_mpp: float,
+) -> np.ndarray:
+    """Uncropped registered canvas (rows, cols) at ``target_mpp``.
+
+    slide.aligned_slide_shape_rc is the level-0 (== reg_mpp) aligned canvas
+    for this section; scaling it by reg_mpp/target_mpp puts every section on
+    the same scaled canvas, which volume.build_volume's np.stack requires.
+    ``warp_and_save_section`` (images) and ``warp_points_to_registered``
+    (nuclei) both use this, so points land in the frame of the image the
+    label maps are segmented from.
+    """
+    scale = reg_mpp / target_mpp
+    return np.ceil(
+        np.asarray(slide.aligned_slide_shape_rc, dtype=float) * scale
+    ).astype(int)
+
+
+def warp_points_to_registered(
+    slide: Any,
+    yx_level0: np.ndarray,
+    *,
+    level0_shape_rc: tuple[int, int],
+    reg_mpp: float = cfg.REG_MPP,
+    target_mpp: float = cfg.SEG_MPP,
+    non_rigid: bool = True,
+    crop: bool | str = True,
+) -> np.ndarray:
+    """Map (y, x) level-0 points of the ORIGINAL slide into the registered
+    canvas, in microns.
+
+    Uses VALIS's own point warp (rigid ``M`` plus the elastic displacement
+    field when ``non_rigid``), the same transform chain
+    ``warp_and_save_section`` applies to the image, so nuclei land on the
+    label maps segmented from that image. The rigid-only Affines in
+    ``section_transforms.pkl`` omit the elastic field.
+
+    VALIS rescales the points itself from ``level0_shape_rc`` (the source
+    slide's level-0 shape) to the canvas ``warp_and_save_section`` writes at
+    ``target_mpp``, and applies the same crop. Do not pre-scale the points.
+
+    Args:
+        slide: VALIS slide object from ``register()`` (or a reloaded registrar).
+        yx_level0: (N, 2) [y, x] points in the source slide's level-0 pixels,
+            e.g. ``detect_nuclei_section``'s ``centroid_y``/``centroid_x``.
+        level0_shape_rc: (rows, cols) of the source slide's level 0.
+        reg_mpp: the ``elastic_mpp`` the slide was registered with.
+        target_mpp: resolution of the registered OME-TIFFs (``seg_mpp``).
+        non_rigid: include the elastic displacement field.
+        crop: crop flag/name, as for ``warp_and_save_section``.
+
+    Returns:
+        (N, 2) float64 [y_um, x_um], origin at the registered canvas's
+        top-left (the frame of the label maps and ``volume.build_volume``).
+    """
+    yx = np.asarray(yx_level0, dtype=np.float64).reshape(-1, 2)
+    if yx.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    canvas_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
+    warped_xy = np.asarray(
+        slide.warp_xy(
+            yx[:, ::-1],
+            slide_level=tuple(int(v) for v in canvas_rc),
+            pt_level=tuple(int(v) for v in level0_shape_rc),
+            non_rigid=non_rigid,
+            crop=crop,
+        ),
+        dtype=np.float64,
+    )
+    return warped_xy[:, ::-1] * target_mpp
 
 
 def build_section_transforms(

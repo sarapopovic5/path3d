@@ -44,7 +44,8 @@ def run_section(slide: io.SlideReader, section_index: int) -> dict:
         section_index: 0-based z-index of this section (from manifest).
 
     Returns:
-        Per-section results dict, including ``level0_mpp`` (native µm/px) so later stages dont need to reopen the slide
+        Per-section results dict, including ``level0_mpp`` (native µm/px) and
+        ``level0_shape_rc`` so later stages dont need to reopen the slide
     """
     results: dict = {"section_index": section_index}
 
@@ -53,6 +54,8 @@ def run_section(slide: io.SlideReader, section_index: int) -> dict:
     results["tissue_mask_80"] = pr.make_tissue_mask(img_80)
     results["img_80"] = img_80
     results["level0_mpp"] = slide.get_mpp()
+    level0_w, level0_h = slide.level_dimensions[0]
+    results["level0_shape_rc"] = (int(level0_h), int(level0_w))
 
     return results
 
@@ -112,6 +115,31 @@ def _write_section_outputs(
         written["nuclei_csv_path"] = nuclei_csv_path
 
     return written
+
+
+def _add_registered_coordinates(
+    nuclei,
+    valis_slide,
+    *,
+    level0_shape_rc: tuple[int, int],
+    reg_mpp: float,
+    target_mpp: float,
+    non_rigid: bool,
+) -> None:
+    """Add ``reg_y_um``/``reg_x_um`` (registered canvas, µm) to a section's
+    nuclei table in place. ``nuclei`` is what ``detect_nuclei_section``
+    returned: a DataFrame, or a dict holding it under ``"features"``."""
+    df = nuclei["features"] if isinstance(nuclei, dict) else nuclei
+    reg_yx = reg.warp_points_to_registered(
+        valis_slide,
+        df[["centroid_y", "centroid_x"]].to_numpy(),
+        level0_shape_rc=level0_shape_rc,
+        reg_mpp=reg_mpp,
+        target_mpp=target_mpp,
+        non_rigid=non_rigid,
+    )
+    df["reg_y_um"] = reg_yx[:, 0]
+    df["reg_x_um"] = reg_yx[:, 1]
 
 
 def _release_section_payload(result: dict, written: dict) -> None:
@@ -282,13 +310,16 @@ def run_pipeline(
     Returns:
         List of per-section result dicts in section order. Each dict
         contains 'section_index', 'tissue_mask_80', 'img_80', 'level0_mpp',
-        and 'registered_path', plus:
+        'level0_shape_rc' and 'registered_path', plus:
             'label_map' -- the on-disk label-PNG Path, or None if no
                 segmentation ran for this section. Never an ndarray.
             'nuclei'    -- {'n_nuclei': int, 'path': Path}, or None if no
                 nuclear detection ran. Never a DataFrame.
         Both are released to their on-disk form as soon as each section is
         written, so RAM doesn't grow with section count over a long run.
+        Nuclei tables of registered sections carry 'reg_y_um'/'reg_x_um',
+        the centroids in the registered canvas (see
+        ``registration.warp_points_to_registered``).
         Per-section outputs land in output_dir/label_maps/ and
         output_dir/nuclei/ as each section completes, so a crash mid-run
         leaves completed sections on disk. Immediately after registration,
@@ -427,6 +458,20 @@ def run_pipeline(
                 gpu=(seg_device != "cpu"),
                 output_zarr=output_zarr,
             )
+            # Centroids are in the unregistered slide's level-0 pixels. Map
+            # them into the registered canvas while the VALIS slide object is
+            # live, through the same rigid + elastic warp the image (and so
+            # the label map) went through. build_volume uses these columns
+            # instead of its rigid-only Affine.
+            if valis_slide is not None:
+                _add_registered_coordinates(
+                    result["nuclei"],
+                    valis_slide,
+                    level0_shape_rc=result["level0_shape_rc"],
+                    reg_mpp=reg_mpp,
+                    target_mpp=seg_mpp,
+                    non_rigid=do_non_rigid,
+                )
 
         # Write whatever this section produced to disk now so that crash (OOM/walltime) on a later section doesn't lose it
         # Then release the heavy RAM values (label map ndarray, nuclei DataFrame) back to on-disk references, so no more
