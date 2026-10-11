@@ -25,6 +25,7 @@ to ``register()`` to do it automatically
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,7 @@ def register(
     # 1/3 PNG export
     img_dir = output_dir / "images"
     img_dir.mkdir(exist_ok=True)
+    png_sources = _drop_stale_pngs(manifest_rows, output_dir, img_dir, elastic_mpp)
 
     n = len(manifest_rows)
     cached = sum(1 for r in manifest_rows
@@ -125,6 +127,7 @@ def register(
         png_paths.append(str(png_path))
         filename_to_idx[png_path.stem] = sid
         filename_to_idx[png_path.name] = sid
+    (output_dir / _PNG_SOURCES).write_text(json.dumps(png_sources, indent=1))
 
     print(f"[VALIS-CPU 1/3] Done. Images in {img_dir}")
 
@@ -878,6 +881,49 @@ def _valis_rigid_to_affine3d(slide: Any, mpp: float, z_um: float) -> Any:
     ])
 
     return Affine(matrix, input_axes=("y", "x"), output_axes=("z", "y", "x"))
+
+
+_PNG_SOURCES = "png_sources.json"
+
+
+def _drop_stale_pngs(
+    manifest_rows: list[dict],
+    output_dir: Path,
+    img_dir: Path,
+    elastic_mpp: float,
+) -> dict[str, list]:
+    """Delete cached registration PNGs whose source slide changed.
+
+    PNGs are named by section index, so editing the manifest (e.g. removing
+    a bad section) gives later indices a different slide, and reusing the
+    output directory used to register the slide that previously had that
+    index. output_dir/png_sources.json records each PNG's source path,
+    size, mtime and mpp; a PNG whose record differs, or has none, is deleted
+    so it is exported again.
+
+    Returns:
+        The records to write once the export is done (previous ones for
+        sections not in this manifest are kept).
+    """
+    record = output_dir / _PNG_SOURCES
+    try:
+        previous = json.loads(record.read_text()) if record.exists() else {}
+    except (OSError, ValueError):
+        previous = {}
+    current = dict(previous)
+    for row in manifest_rows:
+        src = Path(row["path"])
+        try:
+            stat = src.stat()
+            size, mtime = stat.st_size, int(stat.st_mtime)
+        except OSError:  # unreadable source: the export raises a clear error
+            size = mtime = None
+        key = f"{int(row['section_index']):04d}"
+        current[key] = [str(src.resolve()), size, mtime, float(elastic_mpp)]
+        png = img_dir / f"{key}.png"
+        if png.exists() and previous.get(key) != current[key]:
+            png.unlink()
+    return current
 
 
 def _export_section_png(
