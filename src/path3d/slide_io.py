@@ -13,6 +13,7 @@ goes through read_region() which decodes only the requested tiles from disk
 from __future__ import annotations
 
 import csv
+import itertools
 import re
 from abc import ABC, abstractmethod
 from pathlib import Path
@@ -456,6 +457,7 @@ def create_manifest(
     slide_dir: str | Path,
     out_path: str | Path = "manifest.csv",
     thickness_um: list[float] | None = None,
+    section_numbers: list[int] | None = None,
 ) -> Path:
     """Write a manifest CSV from a folder of slide files in filesystem order.
 
@@ -470,14 +472,21 @@ def create_manifest(
             the manifest. When None
             (default), the manifest is written with the original 3-column
             header — byte-identical to the pre-existing format.
+        section_numbers: optional serial number of each section in the block
+            (e.g. the scanner's slide number), one per file in row order,
+            strictly increasing. Consecutive imaged sections differ by 1, so
+            a jump marks sections that were never imaged or were removed;
+            ``volume.build_volume`` keeps that gap in z. Written as a
+            'section_number' column.
 
     Returns:
         Path to the written CSV.
 
     Raises:
         FileNotFoundError: slide_dir does not exist
-        ValueError: no supported slide files found, or thickness_um is
-            provided with a length that does not match the number of files.
+        ValueError: no supported slide files found, or thickness_um or
+            section_numbers is provided with a length that does not match the
+            number of files.
     """
     slide_dir = Path(slide_dir)
     if not slide_dir.exists():
@@ -494,23 +503,26 @@ def create_manifest(
         return [int(c) if c.isdigit() else c.lower() for c in re.split(r"(\d+)", p.name)]
     files.sort(key=_natural_key)
 
-    if thickness_um is not None and len(thickness_um) != len(files):
-        raise ValueError(
-            f"thickness_um has {len(thickness_um)} values but {len(files)} "
-            f"slide files were found in {slide_dir}."
-        )
+    extra_columns: dict[str, list] = {}
+    for name, values in (("thickness_um", thickness_um), ("section_number", section_numbers)):
+        if values is None:
+            continue
+        if len(values) != len(files):
+            raise ValueError(
+                f"{name} has {len(values)} values but {len(files)} "
+                f"slide files were found in {slide_dir}."
+            )
+        extra_columns[name] = list(values)
 
     out_path = Path(out_path)
     with open(out_path, "w", newline="") as f:
         writer = csv.writer(f)
-        if thickness_um is None:
-            writer.writerow(["section_index", "filename", "path"])
-            for i, p in enumerate(files):
-                writer.writerow([i, p.name, str(p)])
-        else:
-            writer.writerow(["section_index", "filename", "path", "thickness_um"])
-            for i, (p, thickness) in enumerate(zip(files, thickness_um)):
-                writer.writerow([i, p.name, str(p), thickness])
+        writer.writerow(["section_index", "filename", "path", *extra_columns])
+        for i, p in enumerate(files):
+            writer.writerow([i, p.name, str(p), *(v[i] for v in extra_columns.values())])
+
+    if section_numbers is not None:
+        load_manifest_section_numbers(out_path)  # validates the values
 
     return out_path
 
@@ -572,6 +584,44 @@ def load_manifest_thickness(csv_path: str | Path) -> list[float | None]:
                 raise ValueError(f"thickness_um must be positive, got {value}")
             thicknesses.append(value)
         return thicknesses
+
+
+def load_manifest_section_numbers(csv_path: str | Path) -> list[int] | None:
+    """Load each section's serial number in the block, in row order.
+
+    The 'section_number' column is optional (see ``create_manifest``). Row
+    order matches ``load_manifest``.
+
+    Returns:
+        List of ints in section order, or None when the column is absent.
+
+    Raises:
+        FileNotFoundError: manifest file does not exist.
+        ValueError: a value is blank or not an integer, or the numbers are
+            not strictly increasing down the manifest.
+    """
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Manifest not found: {csv_path}")
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if "section_number" not in (reader.fieldnames or []):
+            return None
+        numbers: list[int] = []
+        for row in reader:
+            raw = (row.get("section_number") or "").strip()
+            try:
+                numbers.append(int(raw))
+            except ValueError:
+                raise ValueError(
+                    f"section_number must be an integer on every row, got {raw!r}"
+                ) from None
+    if any(b <= a for a, b in itertools.pairwise(numbers)):
+        raise ValueError(
+            "section_number must increase strictly down the manifest (row "
+            "order is z order)."
+        )
+    return numbers
 
 
 # Factory
