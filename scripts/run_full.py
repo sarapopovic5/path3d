@@ -77,8 +77,37 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="write per-section instance masks to zarr (large)",
     )
+    parser.add_argument(
+        "--voxel-um",
+        type=float,
+        default=_env_default("VOXEL_UM"),
+        help="3D volume and quantification resolution, um/voxel, when "
+        "--section-thickness-um/--sampling-interval are not given. "
+        "Env: VOXEL_UM (default: config.VOXEL_UM)",
+    )
+    parser.add_argument(
+        "--section-thickness-um",
+        type=float,
+        default=_env_default("SECTION_THICKNESS_UM"),
+        help="thickness each section was cut at, um. Give with "
+        "--sampling-interval. Env: SECTION_THICKNESS_UM",
+    )
+    parser.add_argument(
+        "--sampling-interval",
+        type=int,
+        default=_env_default("SAMPLING_INTERVAL"),
+        help="every how many cut sections one was stained and imaged (2 = "
+        "every second). Sections are thickness x interval apart, and that is "
+        "the voxel size. Env: SAMPLING_INTERVAL",
+    )
 
     args = parser.parse_args(argv)
+
+    if (args.section_thickness_um is None) != (args.sampling_interval is None):
+        parser.error(
+            "give --section-thickness-um and --sampling-interval together "
+            "(4 um sections with every second one stained: 4 and 2)"
+        )
 
     missing = [
         flag
@@ -121,12 +150,30 @@ def main(argv: list[str] | None = None) -> int:
     pyvips.cache_set_max(0)
     pyvips.cache_set_max_mem(0)
 
+    import path3d.config as cfg
     from path3d.pipeline import run_pipeline
+    from path3d.volume import _resolve_voxel_um
+
+    thickness_um, interval = args.section_thickness_um, args.sampling_interval
+    try:
+        voxel_um, _ = _resolve_voxel_um(
+            args.voxel_um if args.voxel_um is not None or thickness_um is not None else cfg.VOXEL_UM,
+            thickness_um,
+            interval,
+        )
+    except ValueError as exc:
+        sys.exit(str(exc))
 
     print(f"manifest:   {manifest}", flush=True)
     print(f"output:     {output_dir}", flush=True)
     print(f"seg model:  {seg_model or '(segmentation skipped)'}", flush=True)
     print(f"device:     {args.device}", flush=True)
+    print(f"voxel:      {voxel_um:g} um", flush=True)
+    print(
+        "sections:   "
+        + (f"{thickness_um:g} um, every {interval} imaged" if thickness_um else "(not given)"),
+        flush=True,
+    )
 
     results = run_pipeline(
         manifest_path=str(manifest),
@@ -137,6 +184,9 @@ def main(argv: list[str] | None = None) -> int:
         detect_nuclei=not args.no_nuclei,
         do_non_rigid=not args.no_non_rigid,
         persist_nuclei_masks=args.persist_nuclei_masks,
+        voxel_um=voxel_um,
+        section_thickness_um=thickness_um,
+        sampling_interval=interval,
     )
 
     # run_pipeline writes label maps and nuclei CSVs per section as they
@@ -153,6 +203,11 @@ def main(argv: list[str] | None = None) -> int:
             f"n_nuclei={count}" if count is not None else "",
             flush=True,
         )
+
+    report = output_dir / "quantification" / "report.md"
+    if report.exists():
+        print(f"\nvolume:     {output_dir / f'volume_{voxel_um:g}um.zarr'}", flush=True)
+        print(f"report:     {report}", flush=True)
 
     return 0
 
