@@ -11,7 +11,7 @@ pip install path3d
 ```
 
 That is the whole pipeline — slide I/O, CZI support, registration, segmentation,
-nuclear detection and volume assembly. Two things are left out, because each one
+nuclear detection, volume assembly and quantification. Two things are left out, because each one
 breaks an install target the other needs:
 
 ```bash
@@ -35,8 +35,9 @@ dead weight on a headless compute node.
 
 On a cluster, run path3d from an Apptainer image instead of a venv. The image is
 self-contained: Python 3.10, a JRE for VALIS, and the libvips and OpenSlide
-builds from `[binaries]`. It covers preprocessing, registration, segmentation
-and nuclear detection. Visualization is left out and runs locally.
+builds from `[binaries]`. It covers preprocessing, registration, segmentation,
+nuclear detection, volume assembly and quantification. Visualization is left
+out and runs locally.
 
 The steps below follow the Alliance's
 [Apptainer page](https://docs.alliancecan.ca/wiki/Apptainer) and are written for
@@ -116,6 +117,48 @@ conda activate path3d
 Python dependencies are not duplicated in `environment.yml` — it installs the
 project with `pip install -e .[all,dev]`, so `pyproject.toml` stays the single
 source of truth.
+
+## Outputs
+
+`scripts/run_full.py` runs every stage in order and writes into `--out`:
+
+| Path | Contents |
+|------|----------|
+| `label_maps/`, `nuclei/` | Per-section tissue label maps and nuclei tables, written as each section finishes |
+| `section_transforms.pkl`, `volume_build_metadata.json` | Registration transforms and the scalars needed to rebuild the volume |
+| `volume_{voxel}um.zarr` | The 3D SpatialData volume: tissue labels plus the nuclei table |
+| `nuclei_{voxel}um.parquet` | All nuclei, with 3D coordinates in microns |
+| `quantification/report.md` | Readable summary of the quantification, alongside its CSV/parquet tables |
+
+The run never opens a viewer. Copy the output directory to a desktop and view it there:
+
+```python
+from path3d.visualization import view_volume
+view_volume("run_out/volume_8um.zarr")
+```
+
+To rebuild the volume, or quantify it again, from a finished output directory
+without re-running registration or segmentation:
+
+```python
+from path3d.volume import build_volume_from_run
+from path3d.quantification import run_quantification
+
+# 4 um sections, every second one stained: sections 8 um apart, 8 um voxels
+sdata = build_volume_from_run(
+    "run_out",
+    section_thickness_um=4.0,
+    sampling_interval=2,
+    output_path="run_out/volume_8um.zarr",
+)
+run_quantification(
+    sdata, "run_out/quantification", voxel_um=8.0,
+    section_thickness_um=4.0, sampling_interval=2,
+)
+```
+
+Pass `--section-thickness-um` and `--sampling-interval` to `run_full.py` too; the
+run records them, so `build_volume_from_run` reuses them when given neither.
 
 ## Supported formats
 

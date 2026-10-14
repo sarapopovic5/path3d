@@ -7,6 +7,8 @@ tables) into one ``SpatialData`` container: a ``"tissue_labels"``
 Input: per-section ``(H, W)`` integer label maps at ``section_mpp``, already
 warped/registered. Output: ``(z, y, x)`` uint8 volume of isotropic voxels, in
 microns. Z order follows manifest CSV row order, never filename sorting.
+``build_volume_from_run`` does the same from the files a
+``pipeline.run_pipeline`` output directory holds on disk.
 
 Voxel size: given ``section_thickness_um`` and ``sampling_interval``, the
 voxel is the physical spacing between imaged sections on every axis,
@@ -27,6 +29,8 @@ where sections were removed) is an empty placeholder, listed in
 
 from __future__ import annotations
 
+import json
+import pickle
 import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -544,6 +548,174 @@ def build_volume(
         sdata.write(str(output_path))
 
     return sdata
+
+
+def _read_label_png(path: Path) -> np.ndarray:
+    """Read one of the pipeline's own label-map PNGs.
+
+    A section at 0.5 um/px is ~730 MP, past Pillow's decompression-bomb
+    ceiling (which raises above 2x its limit), so the guard is lifted for the
+    read and restored afterwards.
+    """
+    from PIL import Image
+
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            return np.array(im)
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+
+
+def build_volume_from_run(
+    run_dir: str | Path,
+    *,
+    manifest_csv: str | Path | None = None,
+    target_voxel_um: float | None = None,
+    section_thickness_um: float | None = None,
+    sampling_interval: int | None = None,
+    include_nuclei: bool = True,
+    output_path: str | Path | None = None,
+    nuclear_parquet_path: str | Path | None = None,
+    smooth_z_sigma: float = 0.0,
+):
+    """Build the 3D volume from what ``pipeline.run_pipeline`` wrote to disk.
+
+    Reads ``label_maps/{idx:04d}_labels.png``, ``nuclei/{idx:04d}_nuclei.csv``,
+    ``section_transforms.pkl`` and ``volume_build_metadata.json`` from
+    ``run_dir``, so a volume can be built (or rebuilt at another voxel size)
+    without re-registering or re-segmenting. Each label map is downsampled as
+    it is read and then released: all 149 sections of a real stack at 0.5
+    um/px would need ~109 GB, while at 8 um the stack is ~0.4 GB.
+
+    Nuclei CSVs written by ``run_pipeline`` carry ``reg_y_um``/``reg_x_um``
+    (VALIS's full warp). Older run directories lack them, so their nuclei
+    fall back to the rigid Affine in ``section_transforms.pkl``, which omits
+    the elastic field.
+
+    Args:
+        run_dir: pipeline output directory.
+        manifest_csv: manifest defining section order. Defaults to the one
+            recorded in the metadata JSON. Its ``path`` column only serves as
+            dict keys, so a copy holding cluster paths works off-cluster.
+        target_voxel_um: isotropic output resolution, microns, used only
+            without ``section_thickness_um``/``sampling_interval``; see
+            ``build_volume``.
+        section_thickness_um, sampling_interval: thickness each section was
+            cut at (microns) and every how many cut sections one was imaged.
+            Together they set the section spacing and the voxel size, as in
+            ``build_volume``. When neither is given, the values the run
+            recorded in its metadata JSON are used, if it recorded both.
+        include_nuclei: False builds a labels-only volume.
+        output_path: if given, the SpatialData zarr is written here.
+        nuclear_parquet_path: if given, the merged nuclear table is written here.
+        smooth_z_sigma: forwarded to ``build_volume``. Default ``0.0`` (off),
+            as there.
+
+    Returns:
+        The ``SpatialData`` container from ``build_volume``.
+
+    Raises:
+        FileNotFoundError: ``run_dir`` or the transforms pickle is missing.
+        ValueError: no manifest is available; a section has no label map
+            (or, with ``include_nuclei``, no nuclei CSV), since a missing file
+            would silently drop a section; or the thickness, interval and
+            voxel size disagree (see ``build_volume``).
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    metadata_path = run_dir / "volume_build_metadata.json"
+    metadata: dict = {}
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+    manifest_csv = manifest_csv or metadata.get("manifest_csv")
+    if manifest_csv is None:
+        raise ValueError(
+            f"No manifest_csv given and none recorded in {metadata_path}."
+        )
+    manifest_csv = Path(manifest_csv)
+
+    transforms_path = run_dir / metadata.get("transforms_pickle", "section_transforms.pkl")
+    if not transforms_path.exists():
+        raise FileNotFoundError(f"Transforms pickle not found: {transforms_path}")
+    label_maps_dir = run_dir / metadata.get("label_maps_dir", "label_maps")
+    nuclei_dir = run_dir / metadata.get("nuclei_dir", "nuclei")
+
+    section_mpp = float(metadata.get("seg_mpp", 0.5))
+    level0_mpp = metadata.get("level0_mpp")
+    registration_mpp = float(metadata.get("registration_mpp", 8.0))
+
+    # Runs written before sampling_interval was recorded stored the z spacing
+    # under section_thickness_um, so the metadata is used only when it has both.
+    if section_thickness_um is None and sampling_interval is None:
+        recorded = (metadata.get("section_thickness_um"), metadata.get("sampling_interval"))
+        if None not in recorded:
+            section_thickness_um, sampling_interval = recorded
+    voxel_um, _ = _resolve_voxel_um(
+        target_voxel_um, section_thickness_um, sampling_interval
+    )
+
+    paths = load_manifest(manifest_csv)
+
+    label_maps: dict[str, np.ndarray] = {}
+    missing: list[int] = []
+    for i, path in enumerate(paths):
+        png = label_maps_dir / f"{i:04d}_labels.png"
+        if not png.exists():
+            missing.append(i)
+            continue
+        label_maps[str(path)] = _downsample_label_stack(
+            _read_label_png(png), section_mpp, voxel_um
+        )
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(paths)} sections have no label map in "
+            f"{label_maps_dir}: section indices {missing}."
+        )
+
+    nuclear_features: dict[str, pd.DataFrame] | None = None
+    if include_nuclei:
+        nuclear_features = {}
+        missing_nuclei: list[int] = []
+        for i, path in enumerate(paths):
+            csv_path = nuclei_dir / f"{i:04d}_nuclei.csv"
+            if not csv_path.exists():
+                missing_nuclei.append(i)
+                continue
+            nuclear_features[str(path)] = pd.read_csv(csv_path)
+        if missing_nuclei:
+            raise ValueError(
+                f"{len(missing_nuclei)} of {len(paths)} sections have no nuclei "
+                f"CSV in {nuclei_dir}: section indices {missing_nuclei}. Pass "
+                f"include_nuclei=False for a labels-only volume."
+            )
+
+    # Only ever loaded from the run's own directory: unpickling executes code.
+    with open(transforms_path, "rb") as f:
+        transforms = pickle.load(f)
+
+    # The label maps are already at voxel_um, so section_mpp is set to match
+    # and build_volume's own resize is an identity, not a second pass.
+    return build_volume(
+        manifest_csv,
+        label_maps,
+        transforms=transforms,
+        nuclear_features=nuclear_features,
+        target_voxel_um=target_voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        section_mpp=voxel_um,
+        level0_mpp=level0_mpp,
+        registration_mpp=registration_mpp,
+        output_path=output_path,
+        nuclear_parquet_path=nuclear_parquet_path,
+        smooth_z_sigma=smooth_z_sigma,
+    )
 
 
 # ---------------------------------------------------------------------------

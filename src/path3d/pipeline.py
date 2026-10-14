@@ -12,6 +12,8 @@ import path3d.preprocessing as pr
 import path3d.registration as reg
 import path3d.segmentation as sg
 import path3d.nuclear_detection as nd
+import path3d.volume as vol
+import path3d.quantification as qt
 import path3d.config as cfg
 
 
@@ -181,7 +183,8 @@ def _write_volume_build_inputs(
     seg_mpp: float,
     reg_mpp: float,
     level0_mpp: float | None,
-    section_thickness_um: float,
+    section_thickness_um: float | None,
+    sampling_interval: int | None,
     do_non_rigid: bool,
     tissue_type: str,
 ) -> None:
@@ -214,8 +217,9 @@ def _write_volume_build_inputs(
         reg_mpp: Elastic registration resolution (µm/px) the transforms were
             fit at.
         level0_mpp: Native slide resolution (µm/px), or None if uncalibrated.
-        section_thickness_um: Z spacing (microns), recorded for provenance
-            only -- ``build_volume`` derives its own z from the manifest.
+        section_thickness_um, sampling_interval: cut thickness (microns) and
+            imaging interval, or None. ``volume.build_volume_from_run`` reuses
+            them when it is not given its own.
         do_non_rigid: Whether elastic refinement was run, for provenance.
         tissue_type: Key into cfg.TISSUE_CLASSES, for provenance.
 
@@ -240,6 +244,7 @@ def _write_volume_build_inputs(
         "registration_mpp": reg_mpp,
         "level0_mpp": level0_mpp,
         "section_thickness_um": section_thickness_um,
+        "sampling_interval": sampling_interval,
         "do_non_rigid": do_non_rigid,
         "tissue_type": tissue_type,
         "n_sections": len(slide_paths),
@@ -277,13 +282,20 @@ def run_pipeline(
     persist_nuclei_masks: bool = False,
     seg_mpp: float = cfg.SEG_MPP,
     reg_mpp: float = cfg.REG_MPP,
+    voxel_um: float | None = None,
+    section_thickness_um: float | None = None,
+    sampling_interval: int | None = None,
 ) -> list[dict]:
-    """Run the full pipeline over all sections in the manifest.
+    """Run the full pipeline over all sections in the manifest, through the 3D
+    volume and its quantification report.
 
     Each slide is opened, processed, and closed before the next one is opened,
     keeping file-descriptor usage at 1 regardless of stack size. Registration
     runs as a stack-level operation after all sections are processed
-    individually (VALIS needs all slides together).
+    individually (VALIS needs all slides together). Once every section is on
+    disk, the volume is built from those files and quantified. Nothing is
+    rendered or opened for viewing: ``visualization.view_volume`` on the
+    written zarr does that, locally.
 
     Args:
         manifest_path: Path to a manifest CSV from slide_io.create_manifest.
@@ -306,6 +318,17 @@ def run_pipeline(
         reg_mpp:       Elastic registration resolution (µm/px). Must match
             what ``warp_and_save_section`` uses to derive its output canvas
             scale (``reg_mpp / seg_mpp``).
+        voxel_um:      Isotropic resolution (µm/voxel) of the 3D volume and
+            its quantification, used only without ``section_thickness_um``/
+            ``sampling_interval``. None means ``cfg.VOXEL_UM``.
+        section_thickness_um: Thickness each section was cut at (µm). Give
+            with ``sampling_interval``.
+        sampling_interval: Every how many cut sections one was stained and
+            imaged (1 = every section, 2 = every second). With
+            ``section_thickness_um`` it sets the section spacing, which is
+            the voxel size (4 µm x 2 = 8 µm voxels), and the stereological
+            count correction. Without them, the correction treats sections
+            as ``voxel_um`` thick with every one imaged.
 
     Returns:
         List of per-section result dicts in section order. Each dict
@@ -324,10 +347,34 @@ def run_pipeline(
         output_dir/nuclei/ as each section completes, so a crash mid-run
         leaves completed sections on disk. Immediately after registration,
         output_dir/section_transforms.pkl and
-        output_dir/volume_build_metadata.json are also written, so
-        ``volume.build_volume()`` can be called OFFLINE afterwards.
-        ``run_pipeline`` never calls ``volume.build_volume()`` itself
+        output_dir/volume_build_metadata.json are also written, so the
+        volume can be rebuilt offline with ``volume.build_volume_from_run``.
+
+        With segmentation, the run ends by writing
+            output_dir/volume_{voxel_um}um.zarr -- SpatialData volume (labels,
+                plus the nuclei table when nuclei were detected).
+            output_dir/nuclei_{voxel_um}um.parquet -- merged nuclear table.
+            output_dir/quantification/ -- result tables and report.md.
+        Without segmentation there are no label maps, so no volume either.
+
+    Raises:
+        FileExistsError: the volume zarr already exists in ``output_dir``.
+        ValueError: only one of ``section_thickness_um``/``sampling_interval``
+            is given, or ``voxel_um`` disagrees with their spacing.
+        Both are checked before any work, not after hours of it.
     """
+    if voxel_um is None and section_thickness_um is None and sampling_interval is None:
+        voxel_um = cfg.VOXEL_UM
+    voxel_um, _ = vol._resolve_voxel_um(voxel_um, section_thickness_um, sampling_interval)
+
+    output_dir = Path(output_dir)
+    volume_path = output_dir / f"volume_{voxel_um:g}um.zarr"
+    if seg_model is not None and volume_path.exists():
+        raise FileExistsError(
+            f"{volume_path} already exists. Move it or pick another output "
+            f"directory; the volume is written at the end of the run."
+        )
+
     slide_paths = io.load_manifest(manifest_path)
     all_results = []
 
@@ -363,10 +410,9 @@ def run_pipeline(
     # Convenience artifact only -failures are logged (not raised) so they can't abort the run
     try:
         level0_mpp = all_results[0].get("level0_mpp") if all_results else None
-        # section_thickness_um left at build_section_transforms's 12.0 default
-        # (not the user's actual thickness) -- harmless, since build_volume()
-        # recomputes z from the manifest and ignores this baked-in value.
-        section_transforms = reg.build_section_transforms(slides, reg_mpp) 
+        # The transforms' baked-in z is irrelevant: build_volume() overrides
+        # it with each section's physical z.
+        section_transforms = reg.build_section_transforms(slides, reg_mpp, voxel_um)
         _write_volume_build_inputs(
             Path(output_dir),
             slide_paths,
@@ -375,7 +421,8 @@ def run_pipeline(
             seg_mpp=seg_mpp,
             reg_mpp=reg_mpp,
             level0_mpp=level0_mpp,
-            section_thickness_um=12.0,
+            section_thickness_um=section_thickness_um,
+            sampling_interval=sampling_interval,
             do_non_rigid=do_non_rigid,
             tissue_type=tissue_type,
         )
@@ -487,5 +534,34 @@ def run_pipeline(
         _valis_reg.kill_jvm()
     except Exception:
         pass
+
+    # 3D volume, then quantification. Built from the per-section files on
+    # disk, not from all_results, so it is exactly what
+    # volume.build_volume_from_run reproduces from a finished directory.
+    if seg_model_obj is None:
+        print("[INFO] Segmentation skipped: no label maps, so no 3D volume or quantification.")
+        return all_results
+
+    parquet_path = output_dir / f"nuclei_{voxel_um:g}um.parquet" if detect_nuclei else None
+    sdata = vol.build_volume_from_run(
+        output_dir,
+        manifest_csv=manifest_path,
+        target_voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        include_nuclei=detect_nuclei,
+        output_path=volume_path,
+        nuclear_parquet_path=parquet_path,
+    )
+    print(f"[INFO] Wrote {volume_path}" + (f" and {parquet_path}" if parquet_path else ""))
+
+    qt.run_quantification(
+        sdata,
+        output_dir / "quantification",
+        organ=tissue_type,
+        voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+    )
 
     return all_results
