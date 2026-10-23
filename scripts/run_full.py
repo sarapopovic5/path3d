@@ -3,13 +3,19 @@
 
 Every path comes from the environment or the command line, so this script is
 safe to commit and identical on every machine. Machine-specific values live in
-an untracked env file (see ``local/hpc.env``) that is sourced before submission:
+an untracked env file (see ``scripts/slurm/hpc.env.example``).
 
-    source local/hpc.env && sbatch scripts/slurm/run_full.sbatch
-
-or, interactively::
+In one process, interactively::
 
     python scripts/run_full.py --manifest m.csv --out run_out --seg-model dpt.pt
+
+or on Slurm as three chained jobs, with the GPU work split over an array::
+
+    bash scripts/slurm/submit_all.sh local/hpc.env
+
+which runs ``--stage register``, then ``--stage sections`` once per array
+task, then ``--stage volume``. Later stages take the manifest and section
+spacing from what ``register`` recorded in --out.
 
 Omit --seg-model to skip segmentation inference entirely.
 """
@@ -101,6 +107,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the voxel size. Env: SAMPLING_INTERVAL",
     )
 
+    parser.add_argument(
+        "--stage",
+        choices=("all", "register", "sections", "volume"),
+        default="all",
+        help="run everything in one process (all, the default), or one stage "
+        "of a staged run: register (CPU), sections (GPU, this task's share), "
+        "volume (CPU, once every task has finished)",
+    )
+    parser.add_argument(
+        "--task-index",
+        type=int,
+        default=_env_default("SLURM_ARRAY_TASK_ID") or 0,
+        help="sections stage: which task this is, 0-based. "
+        "Env: SLURM_ARRAY_TASK_ID (default: 0)",
+    )
+    parser.add_argument(
+        "--n-tasks",
+        type=int,
+        default=_env_default("SLURM_ARRAY_TASK_COUNT") or 1,
+        help="sections stage: how many tasks share the sections. "
+        "Env: SLURM_ARRAY_TASK_COUNT (default: 1)",
+    )
+
     args = parser.parse_args(argv)
 
     if (args.section_thickness_um is None) != (args.sampling_interval is None):
@@ -109,11 +138,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "(4 um sections with every second one stained: 4 and 2)"
         )
 
-    missing = [
-        flag
-        for flag, value in (("--manifest/MANIFEST", args.manifest), ("--out/OUTDIR", args.out))
-        if not value
-    ]
+    required = [("--out/OUTDIR", args.out)]
+    if args.stage in ("all", "register"):
+        required.append(("--manifest/MANIFEST", args.manifest))
+    missing = [flag for flag, value in required if not value]
     if missing:
         parser.error(
             "missing required path(s): "
@@ -124,17 +152,44 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return args
 
 
+def _print_results(results: list[dict]) -> None:
+    # run_pipeline writes label maps and nuclei CSVs per section as they
+    # complete; this is only a summary of what landed on disk. 'label_map' is a
+    # Path or None, and 'nuclei' is {'n_nuclei', 'path'} or None.
+    print(f"\n{len(results)} sections processed", flush=True)
+    for result in results:
+        nuclei = result.get("nuclei")
+        count = nuclei["n_nuclei"] if nuclei else None
+        print(
+            result["section_index"],
+            result.get("registered_path"),
+            result.get("label_map"),
+            f"n_nuclei={count}" if count is not None else "",
+            flush=True,
+        )
+
+
+def _print_report(output_dir: Path) -> None:
+    report = output_dir / "quantification" / "report.md"
+    if report.exists():
+        for volume in sorted(output_dir.glob("volume_*um.zarr")):
+            print(f"\nvolume:     {volume}", flush=True)
+        print(f"report:     {report}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
     # Fail on a bad path now, with a clear message, rather than partway through
     # a multi-hour job.
-    manifest = Path(args.manifest).expanduser()
-    if not manifest.is_file():
-        sys.exit(f"manifest not found: {manifest}")
+    manifest = None
+    if args.stage in ("all", "register"):
+        manifest = Path(args.manifest).expanduser()
+        if not manifest.is_file():
+            sys.exit(f"manifest not found: {manifest}")
 
     seg_model = None
-    if args.seg_model:
+    if args.seg_model and args.stage in ("all", "sections"):
         seg_model = Path(args.seg_model).expanduser()
         if not seg_model.is_file():
             sys.exit(f"segmentation checkpoint not found: {seg_model}")
@@ -151,8 +206,40 @@ def main(argv: list[str] | None = None) -> int:
     pyvips.cache_set_max_mem(0)
 
     import path3d.config as cfg
-    from path3d.pipeline import run_pipeline
+    import path3d.pipeline as pl
     from path3d.volume import _resolve_voxel_um
+
+    print(f"stage:      {args.stage}", flush=True)
+    print(f"output:     {output_dir}", flush=True)
+
+    if args.stage == "sections":
+        print(f"task:       {args.task_index} of {args.n_tasks}", flush=True)
+        print(f"seg model:  {seg_model or '(segmentation skipped)'}", flush=True)
+        print(f"device:     {args.device}", flush=True)
+        try:
+            results = pl.run_sections_stage(
+                output_dir,
+                task_index=args.task_index,
+                n_tasks=args.n_tasks,
+                seg_model=str(seg_model) if seg_model else None,
+                seg_device=args.device,
+                detect_nuclei=not args.no_nuclei,
+                persist_nuclei_masks=args.persist_nuclei_masks,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(str(exc))
+        _print_results(results)
+        return 0
+
+    if args.stage == "volume":
+        try:
+            pl.run_volume_stage(
+                output_dir, voxel_um=args.voxel_um, detect_nuclei=not args.no_nuclei
+            )
+        except (FileNotFoundError, FileExistsError, ValueError) as exc:
+            sys.exit(str(exc))
+        _print_report(output_dir)
+        return 0
 
     thickness_um, interval = args.section_thickness_um, args.sampling_interval
     try:
@@ -165,9 +252,6 @@ def main(argv: list[str] | None = None) -> int:
         sys.exit(str(exc))
 
     print(f"manifest:   {manifest}", flush=True)
-    print(f"output:     {output_dir}", flush=True)
-    print(f"seg model:  {seg_model or '(segmentation skipped)'}", flush=True)
-    print(f"device:     {args.device}", flush=True)
     print(f"voxel:      {voxel_um:g} um", flush=True)
     print(
         "sections:   "
@@ -175,7 +259,26 @@ def main(argv: list[str] | None = None) -> int:
         flush=True,
     )
 
-    results = run_pipeline(
+    if args.stage == "register":
+        try:
+            results = pl.run_register_stage(
+                str(manifest),
+                output_dir,
+                tissue_type=args.tissue_type,
+                do_non_rigid=not args.no_non_rigid,
+                voxel_um=voxel_um,
+                section_thickness_um=thickness_um,
+                sampling_interval=interval,
+            )
+        except FileExistsError as exc:
+            sys.exit(str(exc))
+        print(f"\n{len(results)} sections registered", flush=True)
+        return 0
+
+    print(f"seg model:  {seg_model or '(segmentation skipped)'}", flush=True)
+    print(f"device:     {args.device}", flush=True)
+
+    results = pl.run_pipeline(
         manifest_path=str(manifest),
         output_dir=str(output_dir),
         seg_model=str(seg_model) if seg_model else None,
@@ -188,26 +291,8 @@ def main(argv: list[str] | None = None) -> int:
         section_thickness_um=thickness_um,
         sampling_interval=interval,
     )
-
-    # run_pipeline writes label maps and nuclei CSVs per section as they
-    # complete; this is only a summary of what landed on disk. 'label_map' is a
-    # Path or None, and 'nuclei' is {'n_nuclei', 'path'} or None.
-    print(f"\n{len(results)} sections processed", flush=True)
-    for result in results:
-        nuclei = result.get("nuclei")
-        count = nuclei["n_nuclei"] if nuclei else None
-        print(
-            result["section_index"],
-            result.get("registered_path"),
-            result.get("label_map"),
-            f"n_nuclei={count}" if count is not None else "",
-            flush=True,
-        )
-
-    report = output_dir / "quantification" / "report.md"
-    if report.exists():
-        print(f"\nvolume:     {output_dir / f'volume_{voxel_um:g}um.zarr'}", flush=True)
-        print(f"report:     {report}", flush=True)
+    _print_results(results)
+    _print_report(output_dir)
 
     return 0
 

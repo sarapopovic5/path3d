@@ -27,6 +27,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -173,19 +174,13 @@ def register(
         create_masks=False,
     )
 
-    slides: dict[int, object] = {}
     with _quiet_valis_registration_progress():
         registrar.register()
     print("\n[VALIS-CPU 2/3] Registration complete.")
 
     # 3/3 Extract slide objects
     print("\n[VALIS-CPU 3/3] Extracting slide objects ...")
-    for slide_name, slide in registrar.slide_dict.items():
-        fname = Path(slide_name).name
-        section_id = filename_to_idx.get(fname)
-        if section_id is None:
-            continue
-        slides[section_id] = slide
+    slides = _slides_by_section(registrar, filename_to_idx)
 
     print(f"[VALIS-CPU 3/3] Done — {len(slides)} slides extracted.")
 
@@ -741,6 +736,53 @@ def _tissue_bbox_mask(
 
 
 _valis_subclasses: dict[str, type] = {}
+
+
+def _slides_by_section(registrar: Any, filename_to_idx: dict[str, int]) -> dict[int, object]:
+    """section_index -> VALIS slide, for the slides whose PNG name
+    (``{section_index:04d}``, with or without ``.png``) is in ``filename_to_idx``."""
+    slides: dict[int, object] = {}
+    for slide_name, slide in registrar.slide_dict.items():
+        section_id = filename_to_idx.get(Path(slide_name).name)
+        if section_id is not None:
+            slides[section_id] = slide
+    return slides
+
+
+def load_registered_slides(
+    output_dir: str | Path, section_indices: Iterable[int]
+) -> dict[int, object]:
+    """Reload the VALIS slide objects ``register()`` produced into ``output_dir``,
+    for the given sections, in a new process.
+
+    VALIS pickles its registrar at the end of ``registrar.register()``, under
+    ``output_dir/<name>/data/<name>_registrar.pickle``. The slides it returns
+    warp images and points exactly as the live ones ``register()`` returned.
+    Only load from a trusted run directory: unpickling executes arbitrary code.
+
+    Returns:
+        section_index -> VALIS slide. A section VALIS dropped is absent, as
+        in ``register()``'s return value.
+
+    Raises:
+        FileNotFoundError: no registrar pickle under ``output_dir`` (the
+            registration did not finish), or more than one.
+    """
+    from valis import registration
+
+    output_dir = Path(output_dir)
+    found = sorted(output_dir.glob("*/data/*_registrar.pickle"))
+    if len(found) != 1:
+        raise FileNotFoundError(
+            f"Expected one VALIS registrar pickle under {output_dir}/*/data/, "
+            f"found {len(found)}: {[str(p) for p in found]}"
+        )
+    registrar = registration.load_registrar(str(found[0]))
+    filename_to_idx = {}
+    for sid in section_indices:
+        filename_to_idx[f"{int(sid):04d}"] = int(sid)
+        filename_to_idx[f"{int(sid):04d}.png"] = int(sid)
+    return _slides_by_section(registrar, filename_to_idx)
 
 
 def _tissue_mask_valis_cls() -> type:
