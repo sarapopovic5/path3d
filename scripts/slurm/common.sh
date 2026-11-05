@@ -8,8 +8,11 @@
 p3d() {
     module load apptainer
     cd "$REPO"
+    # -C drops CUDA_VISIBLE_DEVICES, so it is passed in explicitly: on a MIG
+    # slice it names the slice Slurm allocated, and without it CUDA inside the
+    # container may not pick that slice.
     local nv=()
-    [[ -n ${CUDA_VISIBLE_DEVICES:-} ]] && nv=(--nv)
+    [[ -n ${CUDA_VISIBLE_DEVICES:-} ]] && nv=(--nv --env CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES")
     apptainer run -C ${nv[@]+"${nv[@]}"} -W "${SLURM_TMPDIR:-/tmp}" -B /project -B /scratch \
         --home "$P3HOME" --pwd "$(pwd -P)" --env PYTHONPATH="$(pwd -P)/src" \
         "$SIF" scripts/run_full.py --out "$OUTDIR" "$@" ${EXTRA_ARGS:-}

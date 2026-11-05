@@ -36,7 +36,29 @@ if [[ $from != volume && ! -f ${DPT_CKPT:-} ]]; then
     echo "checkpoint not found: ${DPT_CKPT:-}" >&2; exit 1
 fi
 export N_TASKS=${N_TASKS:-10}
-GPU=${GPU:-h100:1}
+GPU=${GPU:-h100_3g.40gb:1}
+
+# Cores and memory for each array task. A MIG slice is billed by the largest
+# of its GPU, core and memory shares, so asking for more cores or memory than
+# the slice's bundle bills a bigger slice. The values are Nibi's recommended
+# amounts per instance (Alliance docs, "Ratios in bundles"), with memory
+# capped at the 64G a task has needed. Set SECTIONS_CPUS / SECTIONS_MEM to
+# override, e.g. on another cluster.
+case $GPU in
+    *1g.*) cpus=2 mem=31G ;;
+    *2g.*) cpus=4 mem=62G ;;
+    *3g.*) cpus=6 mem=64G ;;
+    *)     cpus=8 mem=64G ;;
+esac
+SECTIONS_CPUS=${SECTIONS_CPUS:-$cpus}
+SECTIONS_MEM=${SECTIONS_MEM:-$mem}
+
+# A job may hold only one MIG slice: Slurm rejects more at submission. The
+# array is what spreads the work over several slices.
+if [[ $GPU =~ [0-9]g\.[0-9]+gb:([0-9]+)$ && ${BASH_REMATCH[1]} != 1 ]]; then
+    echo "GPU=$GPU: a job can hold only one MIG slice; use :1 and raise N_TASKS" >&2
+    exit 1
+fi
 
 slurm_dir="$REPO/scripts/slurm"
 mkdir -p "$OUTDIR/logs"
@@ -50,8 +72,9 @@ if [[ $from == register ]]; then
 fi
 if [[ $from != volume ]]; then
     j2=$(sbatch "${common[@]}" ${after[@]+"${after[@]}"} --output="$OUTDIR/logs/%x-%A_%a.out" \
-        --array=0-$((N_TASKS - 1)) --gpus="$GPU" "$slurm_dir/02_sections.sbatch")
-    echo "sections  $j2 ($N_TASKS tasks, $GPU each)"
+        --array=0-$((N_TASKS - 1)) --gpus="$GPU" \
+        --cpus-per-task="$SECTIONS_CPUS" --mem="$SECTIONS_MEM" "$slurm_dir/02_sections.sbatch")
+    echo "sections  $j2 ($N_TASKS tasks, each $GPU, $SECTIONS_CPUS cores, $SECTIONS_MEM)"
     after=(--dependency=afterok:$j2)
 fi
 j3=$(sbatch "${common[@]}" ${after[@]+"${after[@]}"} --output="$OUTDIR/logs/%x-%j.out" "$slurm_dir/03_volume.sbatch")

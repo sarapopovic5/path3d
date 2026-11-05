@@ -124,6 +124,12 @@ the checkout root:
 bash scripts/slurm/submit_all.sh local/hpc.env
 ```
 
+Each array task runs on one H100 3g.40gb MIG slice by default (`GPU` in the env
+file), with the cores and memory Nibi recommends for that slice, so ten tasks
+are billed about as much as five full GPUs. A job may hold only one MIG slice,
+which is why the work is spread over an array rather than several GPUs per job.
+Each task's log starts with the slice it got (`nvidia-smi -L`).
+
 Logs go to `$OUTDIR/logs/`. The outputs are the same files a single-process run
 writes. Stages 2 and 3 take the manifest, resolutions and section spacing from
 what stage 1 recorded, so the stages cannot disagree.
