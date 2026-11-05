@@ -36,7 +36,7 @@ if [[ $from != volume && ! -f ${DPT_CKPT:-} ]]; then
     echo "checkpoint not found: ${DPT_CKPT:-}" >&2; exit 1
 fi
 export N_TASKS=${N_TASKS:-10}
-GPU=${GPU:-h100_3g.40gb:1}
+GPU=${GPU:-nvidia_h100_80gb_hbm3_3g.40gb:1}
 
 # Cores and memory for each array task. A MIG slice is billed by the largest
 # of its GPU, core and memory shares, so asking for more cores or memory than
