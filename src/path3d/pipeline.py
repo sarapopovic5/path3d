@@ -97,7 +97,9 @@ def _write_section_outputs(
 
         label_map_u8 = label_map.astype(np.uint8)
         label_map_path = label_map_dir / f"{idx:04d}_labels.png"
-        Image.fromarray(label_map_u8).save(label_map_path)
+        tmp_path = label_map_path.with_name(label_map_path.name + ".tmp")
+        Image.fromarray(label_map_u8).save(tmp_path, format="PNG")
+        tmp_path.replace(label_map_path)
         written["label_map_path"] = label_map_path
 
         palette = cfg.TISSUE_CLASS_COLORS[tissue_type]
@@ -113,10 +115,43 @@ def _write_section_outputs(
 
         df = nuclei["features"] if isinstance(nuclei, dict) else nuclei
         nuclei_csv_path = nuclei_dir / f"{idx:04d}_nuclei.csv"
-        df.to_csv(nuclei_csv_path, index=False)
+        # Written under a temporary name and renamed, so a job killed mid-write
+        # never leaves a truncated table that _section_done would count as done.
+        tmp_path = nuclei_csv_path.with_name(nuclei_csv_path.name + ".tmp")
+        df.to_csv(tmp_path, index=False)
+        tmp_path.replace(nuclei_csv_path)
         written["nuclei_csv_path"] = nuclei_csv_path
 
     return written
+
+
+def _section_done(output_dir: Path, idx: int, *, segment: bool, detect_nuclei: bool) -> bool:
+    """Whether a section's outputs from an earlier attempt are already on disk.
+
+    The nuclei CSV is the last file ``_write_section_outputs`` writes, and it
+    is renamed into place, so its presence means the section finished.
+    """
+    if not (segment or detect_nuclei):
+        return False
+    if segment and not (output_dir / "label_maps" / f"{idx:04d}_labels.png").exists():
+        return False
+    if detect_nuclei and not (output_dir / "nuclei" / f"{idx:04d}_nuclei.csv").exists():
+        return False
+    return True
+
+
+def task_sections(n_sections: int, task_index: int, n_tasks: int) -> range:
+    """Manifest rows one task of an ``n_tasks`` array processes.
+
+    Interleaved (task 0 gets rows 0, n_tasks, 2*n_tasks, ...) rather than in
+    contiguous blocks, so every task gets sections from the whole depth of the
+    block and the tasks finish at about the same time.
+    """
+    if n_tasks < 1 or not 0 <= task_index < n_tasks:
+        raise ValueError(
+            f"task_index must be in [0, n_tasks), got {task_index} of {n_tasks}"
+        )
+    return range(task_index, n_sections, n_tasks)
 
 
 def _add_registered_coordinates(
@@ -269,6 +304,272 @@ def _write_volume_build_inputs(
         json.dump(metadata, f, indent=2)
 
 
+def _resolve_run_voxel_um(
+    voxel_um: float | None,
+    section_thickness_um: float | None,
+    sampling_interval: int | None,
+) -> float:
+    """The run's volume resolution: the section spacing when thickness and
+    interval are given, else ``voxel_um``, else ``cfg.VOXEL_UM``."""
+    if voxel_um is None and section_thickness_um is None and sampling_interval is None:
+        voxel_um = cfg.VOXEL_UM
+    voxel_um, _ = vol._resolve_voxel_um(voxel_um, section_thickness_um, sampling_interval)
+    return voxel_um
+
+
+def _check_no_volume(output_dir: Path, voxel_um: float) -> Path:
+    """Path the volume will be written to; raises if it is already there."""
+    volume_path = output_dir / f"volume_{voxel_um:g}um.zarr"
+    if volume_path.exists():
+        raise FileExistsError(
+            f"{volume_path} already exists. Move it or pick another output "
+            f"directory; the volume is written at the end of the run."
+        )
+    return volume_path
+
+
+def _load_seg_model(seg_model, num_classes, tissue_type: str):
+    """Returns ``(model or None, num_classes)``; loads a checkpoint path."""
+    if isinstance(seg_model, (str, Path)):
+        n = num_classes if num_classes is not None else len(cfg.TISSUE_CLASSES[tissue_type])
+        return sg.load_dpt_model(seg_model, n), n
+    if seg_model is not None and num_classes is None:
+        num_classes = len(cfg.TISSUE_CLASSES[tissue_type])
+    return seg_model, num_classes
+
+
+def _kill_jvm() -> None:
+    # The sole call to kill the JVM, at the very end of a process, so that the
+    # JVM is only initialized and killed once. Avoids java-level crash / seg fault
+    try:
+        from valis import registration as _valis_reg
+        _valis_reg.kill_jvm()
+    except Exception:
+        pass
+
+
+def _register_stack(
+    manifest_path: str | Path,
+    output_dir: Path,
+    slide_paths: list[Path],
+    *,
+    do_non_rigid: bool,
+    seg_mpp: float,
+    reg_mpp: float,
+    voxel_um: float,
+    section_thickness_um: float | None,
+    sampling_interval: int | None,
+    tissue_type: str,
+    strict: bool,
+) -> tuple[dict[int, object], list[dict]]:
+    """Per-slide tissue masks, then VALIS over the whole stack, then the
+    volume-build inputs (transforms + metadata) on disk.
+
+    With ``strict``, failing to write those inputs raises: a staged run's
+    later stages read them. Without it, as in ``run_pipeline``, it only warns.
+
+    Returns:
+        (section_index -> VALIS slide, per-section results from run_section)
+    """
+    manifest_rows = [
+        {"section_index": i, "path": str(p)}
+        for i, p in enumerate(slide_paths)
+    ]
+
+    all_results = []
+    for section_index, path in enumerate(slide_paths):
+        with io.open_slide(path) as slide:
+            results = run_section(slide, section_index) # just tissue mask and qc
+        all_results.append(results)
+
+    # Stack-level: register all sections together
+    slides = reg.register(
+        manifest_rows,
+        output_dir,
+        elastic_mpp=reg_mpp,
+        do_non_rigid=do_non_rigid,
+    )
+
+    # Persist transforms + volume-build scalars now (before the long
+    # warp/segment/detect loop) so if a crash partway through happens, volume can still be built
+    try:
+        level0_mpp = all_results[0].get("level0_mpp") if all_results else None
+        # The transforms' baked-in z is irrelevant: build_volume() overrides
+        # it with each section's physical z.
+        section_transforms = reg.build_section_transforms(slides, reg_mpp, voxel_um)
+        _write_volume_build_inputs(
+            output_dir,
+            slide_paths,
+            section_transforms,
+            manifest_path=manifest_path,
+            seg_mpp=seg_mpp,
+            reg_mpp=reg_mpp,
+            level0_mpp=level0_mpp,
+            section_thickness_um=section_thickness_um,
+            sampling_interval=sampling_interval,
+            do_non_rigid=do_non_rigid,
+            tissue_type=tissue_type,
+        )
+        print(
+            f"[INFO] Wrote {output_dir / 'section_transforms.pkl'} and "
+            f"{output_dir / 'volume_build_metadata.json'}"
+        )
+    except Exception as exc:
+        if strict:
+            raise
+        print(f"[WARN] Failed to persist volume-build inputs: {exc}")
+
+    return slides, all_results
+
+
+def _process_section(
+    result: dict,
+    path: Path,
+    valis_slide,
+    *,
+    output_dir: Path,
+    seg_model_obj,
+    num_classes: int | None,
+    seg_device: str,
+    detect_nuclei: bool,
+    persist_nuclei_masks: bool,
+    seg_mpp: float,
+    reg_mpp: float,
+    do_non_rigid: bool,
+    tissue_type: str,
+) -> None:
+    """Warp, segment and detect nuclei in one section, write its outputs and
+    release them from ``result`` (mutated in place).
+
+    ``result`` needs 'section_index' and 'level0_shape_rc'. ``valis_slide`` is
+    the section's VALIS slide object, or None if registration dropped it.
+    """
+    idx = result["section_index"]
+    registered_dir = output_dir / "registered"
+    registered_dir.mkdir(parents=True, exist_ok=True)
+    nuclei_dir = output_dir / "nuclei"
+    if persist_nuclei_masks:
+        nuclei_dir.mkdir(parents=True, exist_ok=True)
+
+    # Warp the section straight from its original slide to seg_mpp and save for segmentation
+    if valis_slide is None:
+        result["registered_path"] = None
+    else:
+        out_path = reg.warp_and_save_section(
+            valis_slide,
+            path,
+            registered_dir / f"{idx:04d}.ome.tiff",
+            target_mpp=seg_mpp,
+            reg_mpp=reg_mpp,
+            non_rigid=do_non_rigid,
+        )
+        result["registered_path"] = out_path
+
+        # Segmentation runs before nuclear detection so it always gets clean GPU state
+
+        if seg_model_obj is not None:
+            # num_classes is always set to an int alongside seg_model_obj
+            # in _load_seg_model -- assert narrows it for the type checker
+            assert num_classes is not None
+            # Tissue mask computed directly from the already-registered
+            # OME-TIFF at _MASK_MPP. No manual resize belongs here
+            # either way: predict_section upsamples this to the seg_mpp
+            # label grid with order=0 nearest-neighbour (categorical
+            # data; bilinear would invent invalid class values).
+            #
+            # Deliberate trade-off vs the previous recipe (kept here for
+            # history, not as a TODO): this no longer warps a mask from
+            # the *original* slide through VALIS, so it no longer needs
+            # the live valis_slide object for masking, and no longer
+            # excludes VALIS-invented canvas padding outside the rotated
+            # section (previously done via an all-255 valid_mask warp --
+            # see git history). A non-black VALIS border fill can
+            # therefore be misclassified as tissue by make_tissue_mask's
+            # brightness heuristic. Accepted intentionally for the
+            # simplicity of not needing a live valis_slide object here.
+            with io.open_slide(out_path) as slide:
+                viz_rgb = pr.downsample_to_mpp(slide, _MASK_MPP)
+            tissue_mask = pr.make_tissue_mask(viz_rgb)
+            result["label_map"] = sg.predict_section(
+                out_path,
+                seg_model_obj,
+                tissue_mask,
+                num_classes=num_classes,
+                section_idx=idx,
+                seg_mpp=seg_mpp,
+                device=seg_device,
+            )
+
+    # Nuclear detection runs after segmentation. runs on the original slide, independent of registration success
+    # as its use is for downstream analysis
+
+    if detect_nuclei:
+        output_zarr = nuclei_dir / f"{idx:04d}.zarr" if persist_nuclei_masks else None
+        result["nuclei"] = nd.detect_nuclei_section(
+            path,
+            seg_mpp=seg_mpp,
+            gpu=(seg_device != "cpu"),
+            output_zarr=output_zarr,
+        )
+        # Centroids are in the unregistered slide's level-0 pixels. Map
+        # them into the registered canvas while the VALIS slide object is
+        # live, through the same rigid + elastic warp the image (and so
+        # the label map) went through. build_volume uses these columns
+        # instead of its rigid-only Affine.
+        if valis_slide is not None:
+            _add_registered_coordinates(
+                result["nuclei"],
+                valis_slide,
+                level0_shape_rc=result["level0_shape_rc"],
+                reg_mpp=reg_mpp,
+                target_mpp=seg_mpp,
+                non_rigid=do_non_rigid,
+            )
+
+    # Write whatever this section produced to disk now so that crash (OOM/walltime) on a later section doesn't lose it
+    # Then release the heavy RAM values (label map ndarray, nuclei DataFrame) back to on-disk references, so no more
+    # than one section output is ever held at once.
+    written = _write_section_outputs(result, output_dir, tissue_type=tissue_type)
+    _release_section_payload(result, written)
+
+
+def _build_and_quantify(
+    output_dir: Path,
+    manifest_path: str | Path,
+    *,
+    voxel_um: float,
+    volume_path: Path,
+    section_thickness_um: float | None,
+    sampling_interval: int | None,
+    detect_nuclei: bool,
+    tissue_type: str,
+) -> None:
+    """3D volume, then quantification. Built from the per-section files on
+    disk, so it is exactly what volume.build_volume_from_run reproduces from
+    a finished directory."""
+    parquet_path = output_dir / f"nuclei_{voxel_um:g}um.parquet" if detect_nuclei else None
+    sdata = vol.build_volume_from_run(
+        output_dir,
+        manifest_csv=manifest_path,
+        target_voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        include_nuclei=detect_nuclei,
+        output_path=volume_path,
+        nuclear_parquet_path=parquet_path,
+    )
+    print(f"[INFO] Wrote {volume_path}" + (f" and {parquet_path}" if parquet_path else ""))
+
+    qt.run_quantification(
+        sdata,
+        output_dir / "quantification",
+        organ=tissue_type,
+        voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+    )
+
+
 def run_pipeline(
     manifest_path: str | Path,
     output_dir: str | Path,
@@ -363,205 +664,242 @@ def run_pipeline(
             is given, or ``voxel_um`` disagrees with their spacing.
         Both are checked before any work, not after hours of it.
     """
-    if voxel_um is None and section_thickness_um is None and sampling_interval is None:
-        voxel_um = cfg.VOXEL_UM
-    voxel_um, _ = vol._resolve_voxel_um(voxel_um, section_thickness_um, sampling_interval)
+    voxel_um = _resolve_run_voxel_um(voxel_um, section_thickness_um, sampling_interval)
 
     output_dir = Path(output_dir)
     volume_path = output_dir / f"volume_{voxel_um:g}um.zarr"
-    if seg_model is not None and volume_path.exists():
-        raise FileExistsError(
-            f"{volume_path} already exists. Move it or pick another output "
-            f"directory; the volume is written at the end of the run."
-        )
+    if seg_model is not None:
+        _check_no_volume(output_dir, voxel_um)
 
     slide_paths = io.load_manifest(manifest_path)
-    all_results = []
+    seg_model_obj, num_classes = _load_seg_model(seg_model, num_classes, tissue_type)
 
-    
-    seg_model_obj = seg_model
-    if isinstance(seg_model, (str, Path)):
-        n = num_classes if num_classes is not None else len(cfg.TISSUE_CLASSES[tissue_type])
-        seg_model_obj = sg.load_dpt_model(seg_model, n)
-        num_classes = n
-    elif seg_model is not None and num_classes is None:
-        num_classes = len(cfg.TISSUE_CLASSES[tissue_type])
-
-    manifest_rows = [
-        {"section_index": i, "path": str(p)}
-        for i, p in enumerate(slide_paths)
-    ]
-
-    for section_index, path in enumerate(slide_paths):
-        with io.open_slide(path) as slide:
-            results = run_section(slide, section_index) # just tissue mask and qc
-        all_results.append(results)
-
-    # Stack-level: register all sections together
-    slides = reg.register(
-        manifest_rows,
+    slides, all_results = _register_stack(
+        manifest_path,
         output_dir,
-        elastic_mpp=reg_mpp,
+        slide_paths,
         do_non_rigid=do_non_rigid,
+        seg_mpp=seg_mpp,
+        reg_mpp=reg_mpp,
+        voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        tissue_type=tissue_type,
+        strict=False,
     )
 
-    # Persist transforms + volume-build scalars now (before the long
-    # warp/segment/detect loop below) so if a crash partway through happens, volume can still be built 
-    # Convenience artifact only -failures are logged (not raised) so they can't abort the run
-    try:
-        level0_mpp = all_results[0].get("level0_mpp") if all_results else None
-        # The transforms' baked-in z is irrelevant: build_volume() overrides
-        # it with each section's physical z.
-        section_transforms = reg.build_section_transforms(slides, reg_mpp, voxel_um)
-        _write_volume_build_inputs(
-            Path(output_dir),
-            slide_paths,
-            section_transforms,
-            manifest_path=manifest_path,
+    for result, path in zip(all_results, slide_paths):
+        _process_section(
+            result,
+            path,
+            slides.get(result["section_index"]),
+            output_dir=output_dir,
+            seg_model_obj=seg_model_obj,
+            num_classes=num_classes,
+            seg_device=seg_device,
+            detect_nuclei=detect_nuclei,
+            persist_nuclei_masks=persist_nuclei_masks,
             seg_mpp=seg_mpp,
             reg_mpp=reg_mpp,
-            level0_mpp=level0_mpp,
-            section_thickness_um=section_thickness_um,
-            sampling_interval=sampling_interval,
             do_non_rigid=do_non_rigid,
             tissue_type=tissue_type,
         )
-        print(
-            f"[INFO] Wrote {Path(output_dir) / 'section_transforms.pkl'} and "
-            f"{Path(output_dir) / 'volume_build_metadata.json'}"
-        )
-    except Exception as exc:
-        print(f"[WARN] Failed to persist volume-build inputs: {exc}")
 
-    # Warp each section straight from its original slide to seg_mpp and save for segmentation
-    
-    registered_dir = Path(output_dir) / "registered"
-    registered_dir.mkdir(parents=True, exist_ok=True)
+    _kill_jvm()
 
-    nuclei_dir = Path(output_dir) / "nuclei"
-    if persist_nuclei_masks:
-        nuclei_dir.mkdir(parents=True, exist_ok=True)
-
-    for result, path in zip(all_results, slide_paths):
-        idx = result["section_index"]
-        valis_slide = slides.get(idx)
-
-        if valis_slide is None:
-            result["registered_path"] = None
-        else:
-            out_path = reg.warp_and_save_section(
-                valis_slide,
-                path,
-                registered_dir / f"{idx:04d}.ome.tiff",
-                target_mpp=seg_mpp,
-                reg_mpp=reg_mpp,
-                non_rigid=do_non_rigid,
-            )
-            result["registered_path"] = out_path
-
-            # Segmentation runs before nuclear detection so it always gets clean GPU state
-           
-            if seg_model_obj is not None:
-                # num_classes is always set to an int alongside seg_model_obj
-                # above -- assert narrows it for the type checker
-                assert num_classes is not None
-                # Tissue mask computed directly from the already-registered
-                # OME-TIFF at _MASK_MPP. No manual resize belongs here
-                # either way: predict_section upsamples this to the seg_mpp
-                # label grid with order=0 nearest-neighbour (categorical
-                # data; bilinear would invent invalid class values).
-                #
-                # Deliberate trade-off vs the previous recipe (kept here for
-                # history, not as a TODO): this no longer warps a mask from
-                # the *original* slide through VALIS, so it no longer needs
-                # the live valis_slide object for masking, and no longer
-                # excludes VALIS-invented canvas padding outside the rotated
-                # section (previously done via an all-255 valid_mask warp --
-                # see git history). A non-black VALIS border fill can
-                # therefore be misclassified as tissue by make_tissue_mask's
-                # brightness heuristic. Accepted intentionally for the
-                # simplicity of not needing a live valis_slide object here.
-                with io.open_slide(out_path) as slide:
-                    viz_rgb = pr.downsample_to_mpp(slide, _MASK_MPP)
-                tissue_mask = pr.make_tissue_mask(viz_rgb)
-                result["label_map"] = sg.predict_section(
-                    out_path,
-                    seg_model_obj,
-                    tissue_mask,
-                    num_classes=num_classes,
-                    section_idx=idx,
-                    seg_mpp=seg_mpp,
-                    device=seg_device,
-                )
-
-        # Nuclear detection runs after segmentation. runs on the original slide, independent of registration success
-        # as its use is for downstream analysis 
-        
-        if detect_nuclei:
-            output_zarr = nuclei_dir / f"{idx:04d}.zarr" if persist_nuclei_masks else None
-            result["nuclei"] = nd.detect_nuclei_section(
-                path,
-                seg_mpp=seg_mpp,
-                gpu=(seg_device != "cpu"),
-                output_zarr=output_zarr,
-            )
-            # Centroids are in the unregistered slide's level-0 pixels. Map
-            # them into the registered canvas while the VALIS slide object is
-            # live, through the same rigid + elastic warp the image (and so
-            # the label map) went through. build_volume uses these columns
-            # instead of its rigid-only Affine.
-            if valis_slide is not None:
-                _add_registered_coordinates(
-                    result["nuclei"],
-                    valis_slide,
-                    level0_shape_rc=result["level0_shape_rc"],
-                    reg_mpp=reg_mpp,
-                    target_mpp=seg_mpp,
-                    non_rigid=do_non_rigid,
-                )
-
-        # Write whatever this section produced to disk now so that crash (OOM/walltime) on a later section doesn't lose it
-        # Then release the heavy RAM values (label map ndarray, nuclei DataFrame) back to on-disk references, so no more
-        # than one section output is ever in all_results at once.
-        written = _write_section_outputs(result, Path(output_dir), tissue_type=tissue_type)
-        _release_section_payload(result, written)
-
-
-    # the sole call to kill the JVM, at the very end of the pipeline, so that JVM is only initialized and killed once
-    # Avoids java-level crash / seg fault
-    try:
-        from valis import registration as _valis_reg
-        _valis_reg.kill_jvm()
-    except Exception:
-        pass
-
-    # 3D volume, then quantification. Built from the per-section files on
-    # disk, not from all_results, so it is exactly what
-    # volume.build_volume_from_run reproduces from a finished directory.
     if seg_model_obj is None:
         print("[INFO] Segmentation skipped: no label maps, so no 3D volume or quantification.")
         return all_results
 
-    parquet_path = output_dir / f"nuclei_{voxel_um:g}um.parquet" if detect_nuclei else None
-    sdata = vol.build_volume_from_run(
+    _build_and_quantify(
         output_dir,
-        manifest_csv=manifest_path,
-        target_voxel_um=voxel_um,
-        section_thickness_um=section_thickness_um,
-        sampling_interval=sampling_interval,
-        include_nuclei=detect_nuclei,
-        output_path=volume_path,
-        nuclear_parquet_path=parquet_path,
-    )
-    print(f"[INFO] Wrote {volume_path}" + (f" and {parquet_path}" if parquet_path else ""))
-
-    qt.run_quantification(
-        sdata,
-        output_dir / "quantification",
-        organ=tissue_type,
+        manifest_path,
         voxel_um=voxel_um,
+        volume_path=volume_path,
         section_thickness_um=section_thickness_um,
         sampling_interval=sampling_interval,
+        detect_nuclei=detect_nuclei,
+        tissue_type=tissue_type,
     )
 
     return all_results
+
+
+# Staged run. run_pipeline above does the same work in one process; these split
+# it at the points where nothing is held in memory between the parts, so each
+# can run as its own Slurm job:
+#
+#   1. run_register_stage  (CPU)        VALIS over the whole stack
+#   2. run_sections_stage  (GPU array)  warp + segment + nuclei, a share of
+#                                       the sections per task
+#   3. run_volume_stage    (CPU)        3D volume + quantification
+#
+# Stage 1 writes the registration (VALIS's pickled registrar) and
+# volume_build_metadata.json; stages 2 and 3 read their settings back from
+# there, so the stages cannot disagree on the manifest, resolutions or
+# section spacing.
+
+
+def _read_run_metadata(output_dir: Path) -> dict:
+    path = output_dir / "volume_build_metadata.json"
+    if not path.exists():
+        raise FileNotFoundError(
+            f"{path} not found. Run the register stage into {output_dir} first."
+        )
+    with open(path) as f:
+        return json.load(f)
+
+
+def run_register_stage(
+    manifest_path: str | Path,
+    output_dir: str | Path,
+    *,
+    do_non_rigid: bool = True,
+    tissue_type: str = "HGSC",
+    seg_mpp: float = cfg.SEG_MPP,
+    reg_mpp: float = cfg.REG_MPP,
+    voxel_um: float | None = None,
+    section_thickness_um: float | None = None,
+    sampling_interval: int | None = None,
+) -> list[dict]:
+    """Stage 1 of a staged run: register the stack and record the run's
+    settings. Arguments as for ``run_pipeline``.
+
+    Raises:
+        FileExistsError: the volume zarr already exists in ``output_dir``.
+        ValueError: as ``run_pipeline``, before any work.
+    """
+    voxel_um = _resolve_run_voxel_um(voxel_um, section_thickness_um, sampling_interval)
+    output_dir = Path(output_dir)
+    _check_no_volume(output_dir, voxel_um)
+
+    slide_paths = io.load_manifest(manifest_path)
+    _, all_results = _register_stack(
+        manifest_path,
+        output_dir,
+        slide_paths,
+        do_non_rigid=do_non_rigid,
+        seg_mpp=seg_mpp,
+        reg_mpp=reg_mpp,
+        voxel_um=voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        tissue_type=tissue_type,
+        strict=True,
+    )
+    _kill_jvm()
+    return all_results
+
+
+def run_sections_stage(
+    output_dir: str | Path,
+    *,
+    task_index: int = 0,
+    n_tasks: int = 1,
+    seg_model=None,
+    num_classes=None,
+    seg_device: str = "cuda",
+    detect_nuclei: bool = True,
+    persist_nuclei_masks: bool = False,
+) -> list[dict]:
+    """Stage 2 of a staged run: warp, segment and detect nuclei in this task's
+    share of the sections (``task_sections``).
+
+    Reloads the registration stage 1 saved. Sections whose outputs are already
+    on disk are skipped, so a failed or timed-out task can simply be
+    resubmitted. Model arguments as for ``run_pipeline``; the manifest,
+    tissue type, resolutions and do_non_rigid come from stage 1.
+
+    Returns:
+        Result dicts, as ``run_pipeline``'s, for the sections processed now.
+    """
+    output_dir = Path(output_dir)
+    meta = _read_run_metadata(output_dir)
+    tissue_type = meta["tissue_type"]
+    slide_paths = io.load_manifest(meta["manifest_csv"])
+
+    mine = task_sections(len(slide_paths), task_index, n_tasks)
+    todo = [
+        idx for idx in mine
+        if not _section_done(output_dir, idx, segment=seg_model is not None,
+                             detect_nuclei=detect_nuclei)
+    ]
+    print(f"[INFO] Task {task_index} of {n_tasks}: sections {list(mine)}, "
+          f"{len(mine) - len(todo)} already done")
+    if not todo:
+        return []
+
+    seg_model_obj, num_classes = _load_seg_model(seg_model, num_classes, tissue_type)
+    slides = reg.load_registered_slides(output_dir, todo)
+
+    results = []
+    for idx in todo:
+        path = slide_paths[idx]
+        with io.open_slide(path) as slide:
+            level0_w, level0_h = slide.level_dimensions[0]
+        result = {"section_index": idx, "level0_shape_rc": (int(level0_h), int(level0_w))}
+        _process_section(
+            result,
+            path,
+            slides.get(idx),
+            output_dir=output_dir,
+            seg_model_obj=seg_model_obj,
+            num_classes=num_classes,
+            seg_device=seg_device,
+            detect_nuclei=detect_nuclei,
+            persist_nuclei_masks=persist_nuclei_masks,
+            seg_mpp=meta["seg_mpp"],
+            reg_mpp=meta["registration_mpp"],
+            do_non_rigid=meta["do_non_rigid"],
+            tissue_type=tissue_type,
+        )
+        results.append(result)
+
+    _kill_jvm()
+    return results
+
+
+def run_volume_stage(
+    output_dir: str | Path,
+    *,
+    voxel_um: float | None = None,
+    detect_nuclei: bool = True,
+) -> None:
+    """Stage 3 of a staged run: build the 3D volume and quantify it, once
+    every section has its label map.
+
+    ``voxel_um`` only matters when stage 1 had no section thickness and
+    interval; pass the same value stage 1 got.
+
+    Raises:
+        FileNotFoundError: a section has no label map, listing which.
+        FileExistsError: the volume zarr already exists.
+    """
+    output_dir = Path(output_dir)
+    meta = _read_run_metadata(output_dir)
+    thickness_um = meta.get("section_thickness_um")
+    interval = meta.get("sampling_interval")
+    voxel_um = _resolve_run_voxel_um(voxel_um, thickness_um, interval)
+    volume_path = _check_no_volume(output_dir, voxel_um)
+
+    n = len(io.load_manifest(meta["manifest_csv"]))
+    missing = [
+        idx for idx in range(n)
+        if not (output_dir / "label_maps" / f"{idx:04d}_labels.png").exists()
+    ]
+    if missing:
+        raise FileNotFoundError(
+            f"No label map for sections {missing}. Rerun the sections stage "
+            f"for the tasks that own them; finished sections are skipped."
+        )
+
+    _build_and_quantify(
+        output_dir,
+        meta["manifest_csv"],
+        voxel_um=voxel_um,
+        volume_path=volume_path,
+        section_thickness_um=thickness_um,
+        sampling_interval=interval,
+        detect_nuclei=detect_nuclei,
+        tissue_type=meta["tissue_type"],
+    )

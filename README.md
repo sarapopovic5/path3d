@@ -104,6 +104,46 @@ Rebuild the image whenever the
 dependencies change. `hpc/container-constraints.txt` holds the version pins,
 and the image records its full resolved set in `/opt/path3d/pip-freeze.txt`.
 
+### Staged run on Slurm
+
+A whole block in one job spends most of its time on one section after another:
+warping, segmenting and Cellpose for each in turn, with the GPU idle through
+registration. `scripts/slurm/` splits the run into three chained jobs instead,
+and spreads the per-section work over a GPU array:
+
+| Stage | Job | Does |
+|-------|-----|------|
+| 1 `register` | CPU | VALIS over the whole stack; saves the registration and the run's settings |
+| 2 `sections` | GPU array, `N_TASKS` tasks | Each task reloads the registration and warps, segments and detects nuclei in every `N_TASKS`-th section |
+| 3 `volume` | CPU | The 3D volume and quantification report, once every task has succeeded |
+
+Copy `scripts/slurm/hpc.env.example` to `local/hpc.env`, fill it in, and from
+the checkout root:
+
+```bash
+bash scripts/slurm/submit_all.sh local/hpc.env
+```
+
+Each array task runs on one H100 3g.40gb MIG slice by default (`GPU` in the env
+file), with the cores and memory Nibi recommends for that slice, so ten tasks
+are billed about as much as five full GPUs. A job may hold only one MIG slice,
+which is why the work is spread over an array rather than several GPUs per job.
+Each task's log starts with the slice it got (`nvidia-smi -L`).
+
+Logs go to `$OUTDIR/logs/`. The outputs are the same files a single-process run
+writes. Stages 2 and 3 take the manifest, resolutions and section spacing from
+what stage 1 recorded, so the stages cannot disagree.
+
+If an array task fails or times out, Slurm never starts the volume job, which
+then stays pending with reason `DependencyNeverSatisfied`. Cancel it and submit
+again from stage 2. Sections already on disk are skipped, so only the
+unfinished ones are redone:
+
+```bash
+scancel <volume job id>
+bash scripts/slurm/submit_all.sh local/hpc.env sections
+```
+
 ### Development environment (conda)
 
 `environment.yml` builds an env with every extra installed and a bundled JDK,
