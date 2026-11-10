@@ -85,6 +85,23 @@ def _non_space_class_indices(organ: str) -> tuple[int, ...]:
     return tuple(sorted(idx for idx, name in class_map.items() if name != "space"))
 
 
+def _tissue_classes(organ: str) -> dict[int, str]:
+    """The organ's class index->name map without `"space"`.
+
+    Quantification reports tissue classes only: no table, CSV column or
+    report row is produced for `space`, and every fraction or share is taken
+    over segmented tissue rather than over the whole canvas.
+
+    Args:
+        organ: Key into `config.TISSUE_CLASSES`, e.g. `"HGSC"`.
+
+    Raises:
+        KeyError: `organ` is not a key of `config.TISSUE_CLASSES`.
+    """
+    class_map = _tissue_class_map(organ)
+    return {idx: class_map[idx] for idx in _non_space_class_indices(organ)}
+
+
 def _labels_array(sdata: "SpatialData") -> np.ndarray:
     """Read the `"tissue_labels"` element off `sdata` as a plain ndarray.
 
@@ -180,8 +197,9 @@ def compute_volumetrics(
 ) -> pd.DataFrame:
     """Per-compartment volumetrics on a tissue-label volume: voxel count,
     physical volume (um3/mm3), volume fraction, 3D connected-component
-    count/sizes, and surface area, for every class in
-    `config.TISSUE_CLASSES[organ]`.
+    count/sizes, and surface area, for every tissue class in
+    `config.TISSUE_CLASSES[organ]` (`space` is left out). `volume_fraction`
+    is the class's share of segmented tissue, not of the whole canvas.
 
     `connectivity=1` (6-connectivity) is the deliberate default -- skimage's
     own default (26-connectivity) silently merges corner-touching,
@@ -197,8 +215,8 @@ def compute_volumetrics(
         csv_path: Optional path to also write the result as CSV.
 
     Returns:
-        DataFrame with columns `_VOLUMETRIC_COLUMNS`, one row per class.
-        Also attached in place at `sdata.tables["nuclei"].uns["volumes"]`
+        DataFrame with columns `_VOLUMETRIC_COLUMNS`, one row per tissue
+        class. Also attached in place at `sdata.tables["nuclei"].uns["volumes"]`
         when that table exists.
 
     Raises:
@@ -208,12 +226,12 @@ def compute_volumetrics(
     _validate_positive("voxel_um", voxel_um)
     if connectivity not in (1, 2, 3):
         raise ValueError(f"connectivity must be one of (1, 2, 3), got {connectivity}")
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
 
     from skimage.measure import label, regionprops_table
 
     labels = _labels_array(sdata)
-    total_voxels = labels.size
+    total_voxels = int(np.isin(labels, list(class_map)).sum())
 
     rows = []
     for class_index, class_name in class_map.items():
@@ -221,7 +239,7 @@ def compute_volumetrics(
         n_voxels = int(mask.sum())
         volume_um3 = n_voxels * voxel_um**3
         volume_mm3 = volume_um3 / 1e9
-        volume_fraction = n_voxels / total_voxels
+        volume_fraction = n_voxels / total_voxels if total_voxels else 0.0
 
         lab, n_components = label(mask, connectivity=connectivity, return_num=True)
         if n_components > 0:
@@ -1003,8 +1021,10 @@ def _local_tissue_composition(
     radius_voxels: float,
     class_indices: tuple[int, ...],
 ) -> dict[int, float]:
-    """Fraction of voxels within a sphere of `radius_voxels` around
-    `centroid_voxel_zyx`, per class in `class_indices` (sums to 1.0).
+    """Share of the in-sphere voxels belonging to `class_indices` that are
+    each class, within a sphere of `radius_voxels` around
+    `centroid_voxel_zyx` (sums to 1.0 over `class_indices`). Voxels of any
+    other class (e.g. `space`) are left out of the denominator.
 
     Crops a cube around the centroid first -- never scans the full volume.
 
@@ -1018,9 +1038,8 @@ def _local_tissue_composition(
 
     Returns:
         `dict[int, float]` mapping each class index to its in-sphere
-        voxel fraction. Every value is `0.0` in the (only possible when
-        `radius_voxels <= 0`) edge case where the sphere contains zero
-        voxels.
+        share. Every value is `0.0` when the sphere holds no voxel of any
+        class in `class_indices`.
     """
     center = np.round(np.asarray(centroid_voxel_zyx, dtype=np.float64)).astype(np.int64)
     half_width = int(np.ceil(radius_voxels))
@@ -1044,14 +1063,13 @@ def _local_tissue_composition(
     )
     sphere_mask = dist2 <= radius_voxels**2
 
-    total = int(sphere_mask.sum())
+    counts = {
+        c: int(np.count_nonzero((cropped == c) & sphere_mask)) for c in class_indices
+    }
+    total = sum(counts.values())
     if total == 0:
         return {c: 0.0 for c in class_indices}
-
-    return {
-        c: float(np.count_nonzero((cropped == c) & sphere_mask)) / total
-        for c in class_indices
-    }
+    return {c: n / total for c, n in counts.items()}
 
 
 def compute_lesion_cell_density(
@@ -1089,7 +1107,9 @@ def compute_lesion_cell_density(
         `sdata.tables["lesions"].obs`, mutated in place with new columns:
         `n_nuclei`, `n_nuclei_corrected`, `density_cells_per_mm3`,
         `density_corrected_cells_per_mm3`, and one `composition_frac_{c}`
-        per class. A lesion with zero nuclei gets all-zero values.
+        per tissue class (share of the tissue within
+        `composition_radius_um`; `space` is left out). A lesion with zero
+        nuclei gets all-zero values.
 
     Raises:
         ValueError: `voxel_um <= 0`; `composition_radius_um <= 0`;
@@ -1116,7 +1136,7 @@ def compute_lesion_cell_density(
             f"{sorted(sdata.tables)}"
         )
 
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
     labels_arr = _labels_array(sdata)
 
     lesion_ids = _assign_nuclei_to_lesions(
@@ -1309,7 +1329,8 @@ def local_sphere_density(
 
     Returns:
         `M`-row DataFrame with `n_nuclei`, `sphere_volume_mm3`,
-        `density_cells_per_mm3`, and one `composition_frac_{c}` per class.
+        `density_cells_per_mm3`, and one `composition_frac_{c}` per tissue
+        class (share of the tissue in the sphere; `space` is left out).
 
     Raises:
         ValueError: `voxel_um <= 0`, or `radius_um <= 0`.
@@ -1318,7 +1339,7 @@ def local_sphere_density(
     """
     _validate_positive("voxel_um", voxel_um)
     _validate_positive("radius_um", radius_um)
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
     if "nuclei" not in sdata.tables:
         raise KeyError(
             f"'nuclei' not found in sdata.tables. Available tables: "
@@ -1370,6 +1391,8 @@ def compute_density(
 ) -> pd.DataFrame:
     """Per-tissue-class global cell density table: nuclei per class
     (exact voxel lookup) over that class's physical volume, in cells/mm3.
+    `space` is left out, so nuclei outside the segmented tissue are not
+    counted.
 
     Args:
         sdata: `SpatialData` container with `tables["nuclei"]` and
@@ -1384,7 +1407,7 @@ def compute_density(
     Returns:
         DataFrame with `class_index`, `class_name`, `n_nuclei`,
         `class_volume_mm3`, `density_cells_per_mm3` (`0.0`, not `NaN`, when
-        volume is `0`), one row per class. Also attached in place at
+        volume is `0`), one row per tissue class. Also attached in place at
         `sdata.tables["nuclei"].uns["density"]`.
 
     Raises:
@@ -1395,7 +1418,7 @@ def compute_density(
     _validate_positive("voxel_um", voxel_um)
     if bandwidth_um < 0:
         raise ValueError(f"bandwidth_um must be >= 0, got {bandwidth_um}")
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
     if "nuclei" not in sdata.tables:
         raise KeyError(
             f"'nuclei' not found in sdata.tables. Available tables: "
@@ -1445,11 +1468,14 @@ def compute_neighborhood_features(
     For each radius `R` in `radii_um` (columns suffixed `_r{int(R)}`):
       - `n_neighbors_r{R}`: other nuclei within `R` microns (self excluded).
       - `density_cells_per_mm3_r{R}`: that count over the sphere volume.
-      - `composition_frac_{c}_r{R}`: fraction of nuclei within `R` (self
-        included) in class `c`, per class.
+      - `composition_frac_{c}_r{R}`: share of the tissue nuclei within `R`
+        (self included) in tissue class `c`. Nuclei sitting in `space` count
+        in `n_neighbors` and the density but not in these shares, and get
+        no column of their own. `np.nan` when no tissue nucleus is within
+        `R`.
       - `shannon_entropy_r{R}`: entropy of those composition fractions.
     Radius-independent: `nn_dist_um_class_{c}`, distance to the nearest
-    OTHER nucleus of class `c` (`np.nan` if no such neighbor exists).
+    OTHER nucleus of tissue class `c` (`np.nan` if no such neighbor exists).
 
     To persist these columns to an already-written Zarr store, call
     `_persist_element(sdata, "nuclei")` afterward.
@@ -1477,7 +1503,7 @@ def compute_neighborhood_features(
     for i, r_um in enumerate(radii_um):
         if r_um <= 0:
             raise ValueError(f"radii_um[{i}] must be > 0, got {r_um}")
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
     if "nuclei" not in sdata.tables:
         raise KeyError(
             f"'nuclei' not found in sdata.tables. Available tables: "
@@ -1531,10 +1557,9 @@ def compute_neighborhood_features(
         density = n_neighbors / sphere_volume_mm3
 
         # Per-class counts from the SAME per-class trees already built above
-        # for nn_dist_um_class_{c}: 5 classes x 3 radii = 15 count-only
-        # queries, versus one giant list allocation.
-        entropy = np.zeros(n_nuclei, dtype=np.float64)
-        frac_cols: dict[int, np.ndarray] = {}
+        # for nn_dist_um_class_{c}: one count-only query per tissue class
+        # and radius, versus one giant list allocation.
+        count_cols: dict[int, np.ndarray] = {}
         for class_index in class_map:
             if class_index in class_trees:
                 class_tree, _ = class_trees[class_index]
@@ -1548,8 +1573,20 @@ def compute_neighborhood_features(
                 # No nuclei of this class anywhere -- fraction is 0.0 for
                 # every nucleus, matching the old per-nucleus count of zero.
                 class_counts = np.zeros(n_nuclei, dtype=np.int64)
+            count_cols[class_index] = class_counts
 
-            frac = class_counts / total_in_radius
+        # Shares are over tissue nuclei only (space nuclei left out of the
+        # denominator); NaN where no tissue nucleus is within the radius.
+        tissue_in_radius = np.sum(list(count_cols.values()), axis=0)
+        entropy = np.zeros(n_nuclei, dtype=np.float64)
+        frac_cols: dict[int, np.ndarray] = {}
+        for class_index, class_counts in count_cols.items():
+            frac = np.divide(
+                class_counts,
+                tissue_in_radius,
+                out=np.full(n_nuclei, np.nan),
+                where=tissue_in_radius > 0,
+            )
             frac_cols[class_index] = frac
             # Vectorised -x*log(x), skipping frac == 0 exactly as the old
             # `if frac > 0.0` branch did (0*log 0 contributes nothing).
@@ -1750,7 +1787,8 @@ def radial_profile(
     Returns:
         DataFrame: one row per shell (`band="shell"`, `shell_index`,
         `r_lo_um`/`r_hi_um`, `n_voxels`, `n_nuclei`, `density_cells_per_mm3`,
-        one `composition_frac_{c}` per class), plus two summary rows
+        one `composition_frac_{c}` per tissue class: its share of the
+        shell's tissue voxels, `space` left out), plus two summary rows
         (`band in {"proximal", "distal"}`) aggregating the qualifying
         shells. `np.nan` (not dropped) for an empty shell's fractions.
 
@@ -1777,7 +1815,7 @@ def radial_profile(
             f"distal_um ({distal_um}) must be >= proximal_um ({proximal_um})"
         )
 
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
 
     structure_mask, row = _lesion_mask(
         sdata, lesion_id, organ=organ, voxel_um=voxel_um, connectivity=connectivity
@@ -1849,9 +1887,12 @@ def radial_profile(
         if n_voxels > 0:
             labels_in_shell = flat_labels[mask_shell]
             for c in class_indices:
-                count_c = int(np.count_nonzero(labels_in_shell == c))
-                class_counts[c] = count_c
-                row_out[f"composition_frac_{c}"] = count_c / n_voxels
+                class_counts[c] = int(np.count_nonzero(labels_in_shell == c))
+            n_tissue = sum(class_counts.values())
+            for c in class_indices:
+                row_out[f"composition_frac_{c}"] = (
+                    class_counts[c] / n_tissue if n_tissue else np.nan
+                )
             shell_volume_mm3 = n_voxels * voxel_um**3 / 1e9
             row_out["density_cells_per_mm3"] = (
                 n_nuclei_shell / shell_volume_mm3 if shell_volume_mm3 > 0 else 0.0
@@ -1879,11 +1920,15 @@ def radial_profile(
             "n_nuclei": total_nuclei,
         }
         if total_voxels > 0:
+            band_counts = {
+                c: sum(counts[c] for counts, k in zip(shell_class_counts, keep) if k)
+                for c in class_indices
+            }
+            n_tissue = sum(band_counts.values())
             for c in class_indices:
-                count_c = sum(
-                    counts[c] for counts, k in zip(shell_class_counts, keep) if k
+                row_out[f"composition_frac_{c}"] = (
+                    band_counts[c] / n_tissue if n_tissue else np.nan
                 )
-                row_out[f"composition_frac_{c}"] = count_c / total_voxels
             volume_mm3 = total_voxels * voxel_um**3 / 1e9
             row_out["density_cells_per_mm3"] = (
                 total_nuclei / volume_mm3 if volume_mm3 > 0 else 0.0
@@ -2304,10 +2349,11 @@ def _render_report(
     steps: list[dict],
     output_dir: Path,
 ) -> str:
-    """The Markdown text of `run_quantification`'s report."""
+    """The Markdown text of `run_quantification`'s report. Tissue classes
+    only: `space` gets no row or column."""
     from datetime import datetime
 
-    class_map = _tissue_class_map(organ)
+    class_map = _tissue_classes(organ)
     shape = tuple(int(s) for s in sdata.labels["tissue_labels"].shape)
     extent_mm = [s * voxel_um / 1000.0 for s in shape]
     n_nuclei = sdata.tables["nuclei"].n_obs if "nuclei" in sdata.tables else None
@@ -2343,8 +2389,8 @@ def _render_report(
         out += [
             "## Tissue composition",
             "",
-            ("Volume of each segmented class. Components are 3D connected "
-             "regions (6-connectivity)."),
+            ("Volume of each tissue class. Fraction is the share of segmented "
+             "tissue. Components are 3D connected regions (6-connectivity)."),
             "",
             _markdown_table(table),
             "",
@@ -2361,8 +2407,8 @@ def _render_report(
             "## Cell density by class",
             "",
             ("Nuclei assigned to the class of the voxel their centroid falls in. "
-             "Counts are 2D detections, not stereologically corrected. Nuclei in "
-             f"`{class_map[0]}` fall outside the segmented tissue."),
+             "Counts are 2D detections, not stereologically corrected. Nuclei "
+             "outside the segmented tissue are not counted."),
             "",
             _markdown_table(table, floatfmt=",.0f", formats={"Volume (mm³)": ",.2f"}),
             "",
@@ -2442,7 +2488,8 @@ def _render_report(
              + ", ".join(f"{p:g}th" for p in profile_percentiles)
              + (" percentiles of volume. The proximal band is the tissue just "
                 "outside the lesion surface, the distal band further out, by true "
-                "3D distance. Composition is the share of voxels of each class.")),
+                "3D distance. Composition is the share of the band's tissue "
+                "voxels in each class.")),
             "",
             _markdown_table(pd.DataFrame(rows), floatfmt=".1f", formats={
                 "Volume (µm³)": ",.0f", "Density (cells/mm³)": ",.0f"}),
@@ -2477,7 +2524,9 @@ def _render_report(
         radii = [int(r) for r in _NEIGHBORHOOD_RADII_UM]
         rows = []
         for c, group in neighbors.groupby("class_index", sort=True):
-            row = {"Class": class_map.get(int(c), str(c)), "Nuclei": len(group)}
+            if int(c) not in class_map:
+                continue
+            row = {"Class": class_map[int(c)], "Nuclei": len(group)}
             for r in radii:
                 row[f"Median neighbours ≤{r} µm"] = group[f"n_neighbors_r{r}"].median()
             row[f"Mean entropy ≤{radii[1]} µm"] = group[f"shannon_entropy_r{radii[1]}"].mean()
@@ -2485,9 +2534,10 @@ def _render_report(
         out += [
             "## Nuclear neighbourhoods",
             "",
-            ("For each nucleus, the other nuclei within each radius, grouped by "
-             "the class the nucleus sits in. Entropy measures how mixed the "
-             "neighbouring nuclei's classes are: 0 when all share one class."),
+            ("For each nucleus in tissue, the other nuclei within each radius, "
+             "grouped by the class the nucleus sits in. Entropy measures how "
+             "mixed the neighbouring tissue nuclei's classes are: 0 when all "
+             "share one class."),
             "",
             _markdown_table(pd.DataFrame(rows), floatfmt=",.0f", formats={
                 f"Mean entropy ≤{radii[1]} µm": ".2f"}),
