@@ -25,7 +25,9 @@ to ``register()`` to do it automatically
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,7 @@ def register(
     section_thickness_um: float = 12.0,
     image_key_pattern: str = "section_{:04d}",
     normalizer=None,
+    non_rigid_mask: str = "tissue",
 ) -> dict[int, object]:
     """Register a section stack with VALIS using CPU-only ORB matching.
 
@@ -57,8 +60,7 @@ def register(
         output_dir:           VALIS output directory (thumbnails, logs). Created if absent.
         elastic_mpp:          Resolution for PNG export and elastic registration (µm/px).
         do_non_rigid:         Run elastic refinement after rigid pass.
-        artifact_masks:       section_index → bool mask (True=artifact). Ignored when
-                              do_non_rigid=False.
+        artifact_masks:       Not implemented; must be None.
         sdata:                Optional SpatialData container. When provided,
                               ``attach_transforms()`` is called automatically so each
                               section's rigid transform is stored under ``microns_3d``.
@@ -66,8 +68,18 @@ def register(
                               ``microns_3d`` (z = section_index * thickness).
         image_key_pattern:    Format string for image keys already loaded in sdata
                               (e.g. ``"section_{:04d}"``).
-        normalizer:           Optional fitted TorchMacenkoNormalizer; when given,
-                              each section PNG is stain-normalised before VALIS sees it.
+        normalizer:           Not implemented; must be None (VALIS registers the
+                              raw ``elastic_mpp`` PNGs).
+        non_rigid_mask:       Region the elastic field is estimated in.
+                              ``"tissue"`` (default): bounding box of the tissue
+                              present in at least 2 rigidly aligned sections
+                              (``_tissue_bbox_mask``). ``"overlap"``: VALIS's
+                              own box for ``create_masks=False``, the region
+                              where EVERY section's image footprint overlaps;
+                              on the pilot it held about half the tissue, left
+                              the rest rigid-only and put seams through the
+                              volume at its edges. The rigid step is the same
+                              for both.
 
     Returns:
         dict mapping section_index → VALIS slide object. Use slide.warp_xy()
@@ -76,7 +88,21 @@ def register(
     Raises:
         ImportError:  valis-wsi not installed.
         RuntimeError: VALIS completed but produced no transforms.
+        ValueError:   unknown ``non_rigid_mask``.
+        NotImplementedError: ``normalizer`` or ``artifact_masks`` is given.
     """
+    if normalizer is not None or artifact_masks is not None:
+        # Both were documented but never wired in; fail instead of silently
+        # registering un-normalised, unmasked images.
+        raise NotImplementedError(
+            "register(): normalizer and artifact_masks are not implemented; "
+            "pass None."
+        )
+    if non_rigid_mask not in ("tissue", "overlap"):
+        raise ValueError(
+            f"non_rigid_mask must be 'tissue' or 'overlap', got {non_rigid_mask!r}"
+        )
+
     try:
         from valis import registration
     except ImportError as exc:
@@ -91,6 +117,7 @@ def register(
     # 1/3 PNG export
     img_dir = output_dir / "images"
     img_dir.mkdir(exist_ok=True)
+    png_sources = _drop_stale_pngs(manifest_rows, output_dir, img_dir, elastic_mpp)
 
     n = len(manifest_rows)
     cached = sum(1 for r in manifest_rows
@@ -108,6 +135,7 @@ def register(
         png_paths.append(str(png_path))
         filename_to_idx[png_path.stem] = sid
         filename_to_idx[png_path.name] = sid
+    (output_dir / _PNG_SOURCES).write_text(json.dumps(png_sources, indent=1))
 
     print(f"[VALIS-CPU 1/3] Done. Images in {img_dir}")
 
@@ -127,7 +155,10 @@ def register(
     )
 
     nr_cls = registration.DEFAULT_NON_RIGID_CLASS if do_non_rigid else None
-    registrar = registration.Valis(
+    valis_cls = (
+        _tissue_mask_valis_cls() if non_rigid_mask == "tissue" else registration.Valis
+    )
+    registrar = valis_cls(
         str(img_dir),
         str(output_dir),
         img_list=png_paths,
@@ -143,19 +174,13 @@ def register(
         create_masks=False,
     )
 
-    slides: dict[int, object] = {}
     with _quiet_valis_registration_progress():
         registrar.register()
     print("\n[VALIS-CPU 2/3] Registration complete.")
 
     # 3/3 Extract slide objects
     print("\n[VALIS-CPU 3/3] Extracting slide objects ...")
-    for slide_name, slide in registrar.slide_dict.items():
-        fname = Path(slide_name).name
-        section_id = filename_to_idx.get(fname)
-        if section_id is None:
-            continue
-        slides[section_id] = slide
+    slides = _slides_by_section(registrar, filename_to_idx)
 
     print(f"[VALIS-CPU 3/3] Done — {len(slides)} slides extracted.")
 
@@ -456,13 +481,7 @@ def warp_and_save_section(
 
     level = _source_level_for_mpp(reader, target_mpp)
 
-    # slide.aligned_slide_shape_rc is the level-0 (== reg_mpp) aligned canvas
-    # for this section; scaling it by reg_mpp/target_mpp puts every section
-    # on the same scaled canvas, which volume.build_volume's np.stack requires.
-    scale = reg_mpp / target_mpp
-    aligned_shape_rc = np.ceil(
-        np.asarray(slide.aligned_slide_shape_rc, dtype=float) * scale
-    ).astype(int)
+    aligned_shape_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
 
     crop_method = slide.get_crop_method(crop)
     bbox_xywh = None
@@ -513,6 +532,78 @@ def warp_and_save_section(
         )
 
     return dst_path
+
+
+def _registered_canvas_shape_rc(
+    slide: Any, reg_mpp: float, target_mpp: float,
+) -> np.ndarray:
+    """Uncropped registered canvas (rows, cols) at ``target_mpp``.
+
+    slide.aligned_slide_shape_rc is the level-0 (== reg_mpp) aligned canvas
+    for this section; scaling it by reg_mpp/target_mpp puts every section on
+    the same scaled canvas, which volume.build_volume's np.stack requires.
+    ``warp_and_save_section`` (images) and ``warp_points_to_registered``
+    (nuclei) both use this, so points land in the frame of the image the
+    label maps are segmented from.
+    """
+    scale = reg_mpp / target_mpp
+    return np.ceil(
+        np.asarray(slide.aligned_slide_shape_rc, dtype=float) * scale
+    ).astype(int)
+
+
+def warp_points_to_registered(
+    slide: Any,
+    yx_level0: np.ndarray,
+    *,
+    level0_shape_rc: tuple[int, int],
+    reg_mpp: float = cfg.REG_MPP,
+    target_mpp: float = cfg.SEG_MPP,
+    non_rigid: bool = True,
+    crop: bool | str = True,
+) -> np.ndarray:
+    """Map (y, x) level-0 points of the ORIGINAL slide into the registered
+    canvas, in microns.
+
+    Uses VALIS's own point warp (rigid ``M`` plus the elastic displacement
+    field when ``non_rigid``), the same transform chain
+    ``warp_and_save_section`` applies to the image, so nuclei land on the
+    label maps segmented from that image. The rigid-only Affines in
+    ``section_transforms.pkl`` omit the elastic field.
+
+    VALIS rescales the points itself from ``level0_shape_rc`` (the source
+    slide's level-0 shape) to the canvas ``warp_and_save_section`` writes at
+    ``target_mpp``, and applies the same crop. Do not pre-scale the points.
+
+    Args:
+        slide: VALIS slide object from ``register()`` (or a reloaded registrar).
+        yx_level0: (N, 2) [y, x] points in the source slide's level-0 pixels,
+            e.g. ``detect_nuclei_section``'s ``centroid_y``/``centroid_x``.
+        level0_shape_rc: (rows, cols) of the source slide's level 0.
+        reg_mpp: the ``elastic_mpp`` the slide was registered with.
+        target_mpp: resolution of the registered OME-TIFFs (``seg_mpp``).
+        non_rigid: include the elastic displacement field.
+        crop: crop flag/name, as for ``warp_and_save_section``.
+
+    Returns:
+        (N, 2) float64 [y_um, x_um], origin at the registered canvas's
+        top-left (the frame of the label maps and ``volume.build_volume``).
+    """
+    yx = np.asarray(yx_level0, dtype=np.float64).reshape(-1, 2)
+    if yx.shape[0] == 0:
+        return np.zeros((0, 2), dtype=np.float64)
+    canvas_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
+    warped_xy = np.asarray(
+        slide.warp_xy(
+            yx[:, ::-1],
+            slide_level=tuple(int(v) for v in canvas_rc),
+            pt_level=tuple(int(v) for v in level0_shape_rc),
+            non_rigid=non_rigid,
+            crop=crop,
+        ),
+        dtype=np.float64,
+    )
+    return warped_xy[:, ::-1] * target_mpp
 
 
 def build_section_transforms(
@@ -586,6 +677,154 @@ def attach_transforms(
 
 
 # Internal helpers
+
+def _tissue_bbox_mask(
+    slides: list[Any],
+    shape_rc: tuple[int, int],
+    *,
+    gray_threshold: float = cfg.TISSUE_GRAY_THRESHOLD,
+    min_sections: int = 2,
+    pad_frac: float = 0.02,
+) -> np.ndarray:
+    """Non-rigid registration mask: bounding box of the tissue present in at
+    least ``min_sections`` rigidly aligned sections, padded by ``pad_frac``.
+
+    Tissue is gray < ``gray_threshold`` (and not black fill) on each VALIS
+    slide image, lightly opened to drop specks, then rigidly warped into the
+    reference frame. Requiring 2 sections ignores debris seen only once.
+
+    Args:
+        slides: VALIS slide objects (``.image``, ``.processed_img_shape_rc``,
+            ``.warp_img``).
+        shape_rc: the reference slide's ``reg_img_shape_rc``.
+
+    Returns:
+        (rows, cols) uint8 mask, 255 inside the box. The full frame when no
+        tissue is found.
+    """
+    from scipy import ndimage
+    from skimage.color import rgb2gray
+
+    counts = np.zeros(shape_rc, dtype=np.int32)
+    for slide in slides:
+        img = np.asarray(slide.image)
+        if img.ndim == 3:
+            gray = rgb2gray(img[..., :3])
+        else:
+            gray = img.astype(float) / max(1.0, float(img.max()))
+        tissue = ndimage.binary_opening((gray < gray_threshold) & (gray > 0.02), iterations=2)
+        tissue = resize(
+            tissue, slide.processed_img_shape_rc, order=0, anti_aliasing=False,
+        )
+        warped = slide.warp_img(
+            255 * tissue.astype(np.uint8), non_rigid=False, crop=False,
+            interp_method="nearest",
+        )
+        counts[np.asarray(warped) > 0] += 1
+
+    rows, cols = np.nonzero(counts >= min_sections)
+    mask = np.zeros(shape_rc, dtype=np.uint8)
+    if rows.size == 0:
+        mask[:] = 255
+        return mask
+    pad_r = int(pad_frac * shape_rc[0]) + 2
+    pad_c = int(pad_frac * shape_rc[1]) + 2
+    r0, r1 = max(0, rows.min() - pad_r), min(shape_rc[0], rows.max() + 1 + pad_r)
+    c0, c1 = max(0, cols.min() - pad_c), min(shape_rc[1], cols.max() + 1 + pad_c)
+    mask[r0:r1, c0:c1] = 255
+    return mask
+
+
+_valis_subclasses: dict[str, type] = {}
+
+
+def _slides_by_section(registrar: Any, filename_to_idx: dict[str, int]) -> dict[int, object]:
+    """section_index -> VALIS slide, for the slides whose PNG name
+    (``{section_index:04d}``, with or without ``.png``) is in ``filename_to_idx``."""
+    slides: dict[int, object] = {}
+    for slide_name, slide in registrar.slide_dict.items():
+        section_id = filename_to_idx.get(Path(slide_name).name)
+        if section_id is not None:
+            slides[section_id] = slide
+    return slides
+
+
+def load_registered_slides(
+    output_dir: str | Path, section_indices: Iterable[int]
+) -> dict[int, object]:
+    """Reload the VALIS slide objects ``register()`` produced into ``output_dir``,
+    for the given sections, in a new process.
+
+    VALIS pickles its registrar at the end of ``registrar.register()``, under
+    ``output_dir/<name>/data/<name>_registrar.pickle``. The slides it returns
+    warp images and points exactly as the live ones ``register()`` returned.
+    Only load from a trusted run directory: unpickling executes arbitrary code.
+
+    Returns:
+        section_index -> VALIS slide. A section VALIS dropped is absent, as
+        in ``register()``'s return value.
+
+    Raises:
+        FileNotFoundError: no registrar pickle under ``output_dir`` (the
+            registration did not finish), or more than one.
+    """
+    from valis import registration
+
+    output_dir = Path(output_dir)
+    found = sorted(output_dir.glob("*/data/*_registrar.pickle"))
+    if len(found) != 1:
+        raise FileNotFoundError(
+            f"Expected one VALIS registrar pickle under {output_dir}/*/data/, "
+            f"found {len(found)}: {[str(p) for p in found]}"
+        )
+    registrar = registration.load_registrar(str(found[0]))
+    filename_to_idx = {}
+    for sid in section_indices:
+        filename_to_idx[f"{int(sid):04d}"] = int(sid)
+        filename_to_idx[f"{int(sid):04d}.png"] = int(sid)
+    return _slides_by_section(registrar, filename_to_idx)
+
+
+def _tissue_mask_valis_cls() -> type:
+    """``valis.registration.Valis`` with ``create_non_rigid_reg_mask`` replaced
+    by ``_tissue_bbox_mask``; everything else, rigid step included, unchanged.
+
+    Built on first use because importing valis is slow. It is reachable as
+    this module's ``_TissueMaskValis`` (see ``__getattr__``), so the registrar
+    VALIS pickles at the end of ``registrar.register()`` can be loaded again
+    in a new process.
+    """
+    if "_TissueMaskValis" not in _valis_subclasses:
+        from valis import registration as _valis_reg
+
+        class _TissueMaskValis(_valis_reg.Valis):
+            def create_non_rigid_reg_mask(self):
+                slides = list(self.slide_dict.values())
+                shape_rc = tuple(self.get_ref_slide().reg_img_shape_rc)
+                mask = _tissue_bbox_mask(slides, shape_rc)
+                for slide in slides:
+                    slide.non_rigid_reg_mask = mask
+
+                from PIL import Image as _PIL
+                Path(self.mask_dir).mkdir(parents=True, exist_ok=True)
+                _PIL.fromarray(mask).save(
+                    Path(self.mask_dir) / f"{self.name}_non_rigid_mask_tissue.png"
+                )
+                print(f"[VALIS-CPU 2/3] Non-rigid mask: tissue bounding box, "
+                      f"{(mask > 0).mean():.0%} of the reference frame")
+
+        # defined in a function, but pickled by its module-level name
+        _TissueMaskValis.__qualname__ = "_TissueMaskValis"
+        _valis_subclasses["_TissueMaskValis"] = _TissueMaskValis
+    return _valis_subclasses["_TissueMaskValis"]
+
+
+def __getattr__(name: str):
+    # pickle looks the registrar's class up by name; build it on demand.
+    if name == "_TissueMaskValis":
+        return _tissue_mask_valis_cls()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 def _valis_quiet_tqdm(iterable=None, *args, desc=None, total=None, **kwargs):
     """change VALIS tqdm's to quiet_progress
@@ -691,6 +930,49 @@ def _valis_rigid_to_affine3d(slide: Any, mpp: float, z_um: float) -> Any:
     ])
 
     return Affine(matrix, input_axes=("y", "x"), output_axes=("z", "y", "x"))
+
+
+_PNG_SOURCES = "png_sources.json"
+
+
+def _drop_stale_pngs(
+    manifest_rows: list[dict],
+    output_dir: Path,
+    img_dir: Path,
+    elastic_mpp: float,
+) -> dict[str, list]:
+    """Delete cached registration PNGs whose source slide changed.
+
+    PNGs are named by section index, so editing the manifest (e.g. removing
+    a bad section) gives later indices a different slide, and reusing the
+    output directory used to register the slide that previously had that
+    index. output_dir/png_sources.json records each PNG's source path,
+    size, mtime and mpp; a PNG whose record differs, or has none, is deleted
+    so it is exported again.
+
+    Returns:
+        The records to write once the export is done (previous ones for
+        sections not in this manifest are kept).
+    """
+    record = output_dir / _PNG_SOURCES
+    try:
+        previous = json.loads(record.read_text()) if record.exists() else {}
+    except (OSError, ValueError):
+        previous = {}
+    current = dict(previous)
+    for row in manifest_rows:
+        src = Path(row["path"])
+        try:
+            stat = src.stat()
+            size, mtime = stat.st_size, int(stat.st_mtime)
+        except OSError:  # unreadable source: the export raises a clear error
+            size = mtime = None
+        key = f"{int(row['section_index']):04d}"
+        current[key] = [str(src.resolve()), size, mtime, float(elastic_mpp)]
+        png = img_dir / f"{key}.png"
+        if png.exists() and previous.get(key) != current[key]:
+            png.unlink()
+    return current
 
 
 def _export_section_png(

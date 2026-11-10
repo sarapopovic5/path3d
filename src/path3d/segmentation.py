@@ -495,6 +495,41 @@ def load_dpt_model(path: str | Path, num_classes: int) -> nn.Module:
 # INFERENCE
 
 
+def resolution_matched_tile_size(
+    seg_mpp: float,
+    train_mpp: float = cfg.SEG_TRAIN_MPP,
+) -> int:
+    """Tile size (px at ``seg_mpp``) that shows the encoder tissue at the
+    checkpoint's training resolution.
+
+    ``_preprocess`` resizes every tile to ``_SEG_IMG_SIZE`` (448), so a tile of
+    T px at ``seg_mpp`` reaches the encoder at ``seg_mpp * T / 448`` um/px.
+    Setting that equal to ``train_mpp`` gives T = 448 * train_mpp / seg_mpp:
+    394 px at 0.5 um/px for the 0.4402 um/px training patches. The old
+    1024 px default showed the encoder 1.14 um/px, 2.6x coarser than
+    training. Validation Dice cannot catch that, because validation feeds the
+    448 px training patches to the model directly.
+    """
+    return int(round(_SEG_IMG_SIZE * train_mpp / seg_mpp))
+
+
+def _warn_if_off_training_scale(
+    tile_size: int, seg_mpp: float, train_mpp: float, tolerance: float = 0.05,
+) -> None:
+    """Warn when tiles reach the encoder more than ``tolerance`` away from
+    the resolution the checkpoint was trained at."""
+    presented_mpp = seg_mpp * tile_size / _SEG_IMG_SIZE
+    if abs(presented_mpp / train_mpp - 1.0) > tolerance:
+        import warnings
+
+        warnings.warn(
+            f"tile_size={tile_size} at seg_mpp={seg_mpp} shows the encoder "
+            f"{presented_mpp:.3f} um/px; the checkpoint was trained at "
+            f"{train_mpp:.3f} um/px. Leave tile_size=None to match it.",
+            stacklevel=3,
+        )
+
+
 def _run_batch(
     tiles: list[np.ndarray],
     positions: list[tuple[int, int, int, int]],
@@ -528,8 +563,9 @@ def predict_section(
     *,
     section_idx: int,
     seg_mpp: float = cfg.SEG_MPP,
-    tile_size: int = 1024,
-    overlap: int = 192,
+    tile_size: int | None = None,
+    overlap: int | None = None,
+    train_mpp: float = cfg.SEG_TRAIN_MPP,
     batch_size: int = 8,
     device: str = 'cuda',
     section_thickness_um: float = 12.0,
@@ -553,8 +589,15 @@ def predict_section(
         section_idx: z-index of this section (used for z placement in sdata).
         seg_mpp: target resolution in um/px (default `config.SEG_MPP`, matching
             tile extraction).
-        tile_size: tile side length in pixels.
-        overlap: overlap between adjacent tiles in pixels
+        tile_size: tile side length in pixels at ``seg_mpp``. None (default)
+            derives it from ``train_mpp`` via
+            ``resolution_matched_tile_size``, so the encoder sees tissue at
+            its training resolution. Other values warn when they move the
+            encoder more than 5% off that resolution.
+        overlap: overlap between adjacent tiles in pixels. None (default)
+            uses ~20% of ``tile_size`` (as 192 on 1024).
+        train_mpp: resolution (um/px) the checkpoint was trained at
+            (default `config.SEG_TRAIN_MPP`).
         batch_size: tiles per GPU batch
         device: 'cuda', 'mps', or'cpu'.
         section_thickness_um: z spacing between sections in microns.
@@ -566,6 +609,15 @@ def predict_section(
         (H, W) int32 label map at seg_mpp um/px. (0.5)
         Space pixels are assigned class 0
     """
+    if tile_size is None:
+        tile_size = resolution_matched_tile_size(seg_mpp, train_mpp)
+    else:
+        _warn_if_off_training_scale(tile_size, seg_mpp, train_mpp)
+    if overlap is None:
+        overlap = int(round(0.2 * tile_size))
+    if not 0 <= overlap < tile_size:
+        raise ValueError(f"overlap ({overlap}) must be in [0, tile_size={tile_size})")
+
     model = model.to(device)
     model.eval()
 
@@ -622,9 +674,11 @@ def predict_section(
                 (int(x * ds), int(y * ds)), level, (tw, th),
             )  # (th, tw, 3) uint8
 
-            # pad boundary tiles to tile_size for uniform batch dimensions
+            # pad boundary tiles to tile_size for uniform batch dimensions.
+            # White (glass-like) fill: black is far outside the H&E the
+            # encoder was trained on.
             if th < tile_size or tw < tile_size:
-                padded           = np.zeros((tile_size, tile_size, 3), dtype=np.uint8)
+                padded           = np.full((tile_size, tile_size, 3), 255, dtype=np.uint8)
                 padded[:th, :tw] = tile
                 tile             = padded
 

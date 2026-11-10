@@ -5,27 +5,102 @@ tables) into one ``SpatialData`` container: a ``"tissue_labels"``
 ``Labels3DModel`` under coordinate system ``"microns_3d"``.
 
 Input: per-section ``(H, W)`` integer label maps at ``section_mpp``, already
-warped/registered. Output: ``(z, y, x)`` uint8 volume at ``target_voxel_um``
-isotropic, in microns. Z order follows manifest CSV row order, never
-filename sorting.
+warped/registered. Output: ``(z, y, x)`` uint8 volume of isotropic voxels, in
+microns. Z order follows manifest CSV row order, never filename sorting.
+``build_volume_from_run`` does the same from the files a
+``pipeline.run_pipeline`` output directory holds on disk.
 
-Deliberate divergences: (1) rigid-only, elastic fields are not baked in;
-(2) label z-pitch is always uniform ``target_voxel_um``; variable
-``thickness_um`` applies to nuclear z only.
+Voxel size: given ``section_thickness_um`` and ``sampling_interval``, the
+voxel is the physical spacing between imaged sections on every axis,
+thickness x interval (4 um sections with every second one stained: 8 x 8 x 8
+um), so each z-plane holds one section. Without them it is
+``target_voxel_um`` (12 um by default).
+
+Deliberate divergences: (1) nuclei use the full VALIS warp (rigid +
+elastic) when their table carries ``reg_y_um``/``reg_x_um``, which
+``pipeline.run_pipeline`` writes; tables without them fall back to the
+section's rigid Affine, which omits the elastic field; (2) sections sit at
+their physical z (manifest ``section_number`` x section spacing, or
+cumulative ``thickness_um``), shared by labels and nuclei. The volume is a
+uniform voxel grid, and a z-plane with no section within half a pitch (e.g.
+where sections were removed) is an empty placeholder, listed in
+``sdata.attrs["z_planes"]``.
 """
 
 from __future__ import annotations
 
+import json
+import pickle
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 
-from path3d.slide_io import load_manifest, load_manifest_thickness
+from path3d.slide_io import (
+    load_manifest,
+    load_manifest_section_numbers,
+    load_manifest_thickness,
+)
 
 if TYPE_CHECKING:
     from spatialdata.transformations import Affine
+
+
+# Nuclear-table columns holding centroids already warped into the registered
+# canvas (microns), written by pipeline.run_pipeline.
+_REGISTERED_COLUMNS = frozenset({"reg_y_um", "reg_x_um"})
+
+# Voxel size when the section thickness and sampling interval are not given.
+_DEFAULT_VOXEL_UM = 12.0
+
+
+def _resolve_voxel_um(
+    target_voxel_um: float | None,
+    section_thickness_um: float | None,
+    sampling_interval: int | None,
+) -> tuple[float, float | None]:
+    """Voxel size and section spacing, in microns.
+
+    Consecutive imaged sections are ``section_thickness_um`` x
+    ``sampling_interval`` apart (4 um sections, every second one stained:
+    8 um), and the voxel is that spacing on every axis. Without either, the
+    voxel is ``target_voxel_um`` (``_DEFAULT_VOXEL_UM`` when None) and the
+    spacing is unknown (None).
+
+    Raises:
+        ValueError: only one of ``section_thickness_um``/``sampling_interval``
+            is given, either is out of range, or ``target_voxel_um`` is also
+            given and is not the spacing.
+    """
+    if section_thickness_um is None and sampling_interval is None:
+        voxel_um = _DEFAULT_VOXEL_UM if target_voxel_um is None else float(target_voxel_um)
+        return voxel_um, None
+    if section_thickness_um is None or sampling_interval is None:
+        raise ValueError(
+            "Give section_thickness_um and sampling_interval together: sections "
+            "are cut thickness x sampling interval apart (4 um sections with "
+            "every 2nd one stained are 8 um apart)."
+        )
+    if section_thickness_um <= 0:
+        raise ValueError(
+            f"section_thickness_um must be > 0, got {section_thickness_um}"
+        )
+    if int(sampling_interval) != sampling_interval or sampling_interval < 1:
+        raise ValueError(
+            "sampling_interval must be a whole number >= 1 (1 = every section "
+            f"stained, 2 = every second), got {sampling_interval}"
+        )
+    spacing_um = float(section_thickness_um) * int(sampling_interval)
+    if target_voxel_um is not None and not np.isclose(target_voxel_um, spacing_um):
+        raise ValueError(
+            f"target_voxel_um = {target_voxel_um} um, but sections are "
+            f"{section_thickness_um} um x every {int(sampling_interval)} = "
+            f"{spacing_um} um apart, and the voxel is that spacing. Leave "
+            f"target_voxel_um out."
+        )
+    return spacing_um, spacing_um
 
 
 def _cumulative_z_from_thickness(
@@ -49,6 +124,46 @@ def _cumulative_z_from_thickness(
         z.append(running)
         running += t if t is not None else default
     return z
+
+
+def _section_z_um(
+    section_numbers: list[int] | None,
+    thickness_per_section: list[float | None],
+    spacing_um: float,
+) -> np.ndarray:
+    """Physical z of each section in microns, the first section at 0.
+
+    From ``section_numbers`` when the manifest has them (consecutive imaged
+    sections are ``spacing_um`` apart, so a jump in numbers leaves a gap),
+    else cumulative ``thickness_per_section`` with ``spacing_um`` for blanks.
+    """
+    if section_numbers is not None:
+        numbers = np.asarray(section_numbers, dtype=np.float64)
+        return (numbers - numbers[0]) * spacing_um
+    return np.asarray(
+        _cumulative_z_from_thickness(thickness_per_section, default=spacing_um),
+        dtype=np.float64,
+    )
+
+
+def _plane_sources(section_z_um: np.ndarray, target_voxel_um: float) -> np.ndarray:
+    """Which section each plane of the ``target_voxel_um`` z grid shows.
+
+    A plane shows the nearest section when it lies within half a pitch (the
+    larger of the closest section spacing and the voxel size). Otherwise no
+    section was imaged there and the plane is a placeholder (-1). Nearest-
+    section lookup keeps the labels categorical.
+
+    Returns:
+        (n_planes,) int array of manifest positions, -1 for placeholders.
+    """
+    n_planes = int(np.floor(section_z_um[-1] / target_voxel_um + 1e-6)) + 1
+    plane_z = np.arange(n_planes) * target_voxel_um
+    nearest = np.abs(plane_z[:, None] - section_z_um[None, :]).argmin(axis=1)
+    steps = np.diff(section_z_um)
+    pitch = max(target_voxel_um, float(steps.min()) if steps.size else 0.0)
+    too_far = np.abs(plane_z - section_z_um[nearest]) > pitch / 2 + 1e-6
+    return np.where(too_far, -1, nearest)
 
 
 def _downsample_label_stack(
@@ -149,40 +264,77 @@ def build_volume(
     *,
     transforms: dict[str, Affine] | None = None,
     nuclear_features: dict[str, pd.DataFrame] | None = None,
-    target_voxel_um: float = 12.0,
+    target_voxel_um: float | None = None,
     section_mpp: float = 0.5,
     level0_mpp: float | None = None,
     registration_mpp: float | None = None,
     output_path: str | Path | None = None,
     nuclear_parquet_path: str | Path | None = None,
-    smooth_z_sigma: float = 1.0,
+    smooth_z_sigma: float = 0.0,
+    section_thickness_um: float | None = None,
+    sampling_interval: int | None = None,
 ):
     """Assemble per-section label maps (+ optional nuclear features) into one
     3D SpatialData container.
 
-    Section order/count come from ``load_manifest`` row order; z-index k =
-    enumerate position k, label maps keyed by ``str(path)``. Label z-spacing
-    is unconditionally ``target_voxel_um``, never ``thickness_um``. With
-    ``nuclear_features`` (``transforms``, ``level0_mpp``,
-    ``registration_mpp`` then required), centroids are mapped to microns via
-    the section's rigid Affine, z overridden with cumulative-thickness z,
-    and globally-unique instance IDs attached as ``tables["nuclei"]``.
-    Output is rechunked to ``(1, 512, 512)``.
+    Section order/count come from ``load_manifest`` row order, label maps
+    keyed by ``str(path)``. Consecutive imaged sections are
+    ``section_thickness_um`` x ``sampling_interval`` apart, and the voxel is
+    that spacing on every axis (8 x 8 x 8 um for 4 um sections with every
+    second one stained). Each section sits at its physical z: the manifest's
+    ``section_number`` column times the spacing when present (a jump in
+    numbers is a gap), else cumulative ``thickness_um``, else the spacing
+    apart. The label volume is a uniform voxel grid starting at the first
+    section; each z-plane shows the nearest section within half a pitch, and
+    planes with none (a gap) are left empty (0). ``sdata.attrs["z_planes"]``
+    records each plane's ``z_um`` and ``section_index`` (manifest position,
+    -1 for a placeholder), and ``sdata.attrs["voxel"]`` the voxel size and
+    the thickness and interval it came from. With
+    ``nuclear_features``, each nucleus's in-plane position comes from its
+    table's ``reg_y_um``/``reg_x_um`` columns when present: centroids already
+    mapped through VALIS's rigid + elastic point warp
+    (``registration.warp_points_to_registered``), i.e. the transform the label
+    maps were warped with. Tables without those columns fall back to the
+    section's rigid Affine (``transforms``, ``level0_mpp`` and
+    ``registration_mpp`` then required), which omits the elastic field.
+    Globally-unique instance IDs are attached as ``tables["nuclei"]``; nuclei take their section's
+    physical z, the same z its labels are placed at. Output is rechunked to
+    ``(1, 512, 512)``.
 
     Args:
-        manifest_csv: manifest CSV (section_index, filename, path[, thickness_um]).
+        manifest_csv: manifest CSV (section_index, filename, path[,
+            thickness_um][, section_number]). ``section_number`` counts
+            imaged sections (consecutive stained sections differ by 1), and
+            ``thickness_um`` is the distance to the next manifest row; with
+            ``section_thickness_um`` it must equal the section spacing.
         label_maps: ``str(path)`` -> (H, W) integer label map, at ``section_mpp``.
-        transforms: ``str(path)`` -> full rigid Affine. Required with ``nuclear_features``.
-        nuclear_features: ``str(path)`` -> nuclear feature ``pd.DataFrame`` (level-0
+        transforms: ``str(path)`` -> full rigid Affine. Required when a
+            ``nuclear_features`` table lacks ``reg_y_um``/``reg_x_um``.
+        nuclear_features: ``str(path)`` -> nuclear feature ``pd.DataFrame``
+            (``reg_y_um``/``reg_x_um`` in the registered canvas, or level-0
             pixel centroids). Omit for no ``tables["nuclei"]``.
-        target_voxel_um: isotropic output resolution, microns.
+        target_voxel_um: isotropic output resolution, microns, used only
+            without ``section_thickness_um``/``sampling_interval``. None means
+            12 um. Passing a value other than the section spacing raises.
         section_mpp: input label-map resolution, microns per pixel.
         level0_mpp, registration_mpp: level-0 and Affine-fit resolutions, microns/px.
-            Both required with ``nuclear_features``.
+            Required with ``transforms``.
         output_path: if given, ``sdata.write()`` target.
         nuclear_parquet_path: if given, merged nuclear table written here.
-        smooth_z_sigma: pre-mapping Affine in-plane smoothing sigma; ``0.0``
-            disables. Unused without ``nuclear_features``.
+        smooth_z_sigma: in-plane smoothing sigma (in sections) applied to the
+            rigid Affines before mapping. Default ``0.0`` (off): adjacent
+            sections sit on their slides at very different angles, so
+            averaging their parameters gives transforms that belong to no
+            section, and the label maps are never smoothed. Only used on the
+            rigid-Affine fallback.
+        section_thickness_um: thickness each section was cut at, microns.
+            Give with ``sampling_interval``.
+        sampling_interval: every how many cut sections one was stained and
+            imaged (1 = every section, 2 = every second). With
+            ``section_thickness_um`` it sets the section spacing and the
+            voxel size. Without both, consecutive sections are placed
+            ``target_voxel_um`` apart with a warning, unless every manifest
+            row has a ``thickness_um``.
 
     Returns:
         ``SpatialData`` with ``labels["tissue_labels"]``, plus ``tables["nuclei"]``
@@ -191,8 +343,11 @@ def build_volume(
     Raises:
         ImportError: spatialdata (or anndata) is not installed.
         KeyError: a manifest path is missing from ``label_maps`` or ``nuclear_features``.
-        ValueError: ``nuclear_features`` given without ``transforms``, ``level0_mpp``,
-            or ``registration_mpp``.
+        ValueError: a ``nuclear_features`` table lacks ``reg_y_um``/``reg_x_um``
+            and ``transforms``, ``level0_mpp`` or ``registration_mpp`` is missing;
+            only one of ``section_thickness_um``/``sampling_interval`` is
+            given; ``target_voxel_um`` or the manifest's ``thickness_um``
+            disagrees with the section spacing.
     """
     try:
         from spatialdata import SpatialData
@@ -203,8 +358,10 @@ def build_volume(
             "spatialdata is required. Install: pip install spatialdata"
         ) from exc
 
+    voxel_um, spacing_um = _resolve_voxel_um(
+        target_voxel_um, section_thickness_um, sampling_interval
+    )
     paths = load_manifest(manifest_csv)
-    n = len(paths)
 
     resized_sections: list[np.ndarray] = []
     for path in paths:
@@ -215,28 +372,59 @@ def build_volume(
                 f"label_maps must contain an entry for every manifest row."
             )
         resized_sections.append(
-            _downsample_label_stack(label_maps[key], section_mpp, target_voxel_um)
+            _downsample_label_stack(label_maps[key], section_mpp, voxel_um)
         )
 
-    vol = np.stack(resized_sections, axis=0).astype(np.uint8)
+    stack = np.stack(resized_sections, axis=0).astype(np.uint8)
 
-    # LABEL VOLUME Z IS ALWAYS UNIFORM (05-CONTEXT.md "Scope amendment" /
-    # module docstring's "Deliberate scoping choice"): all-None input always
-    # yields the uniform target_voxel_um pitch, regardless of any
-    # thickness_um manifest column -- computed here purely to reuse the
-    # shared helper and document the intent, not because thickness feeds in.
-    _cumulative_z_from_thickness([None] * n, default=target_voxel_um)
+    # Physical z of every section; labels and nuclei both use it, so a
+    # nucleus is always looked up in its own section.
+    section_numbers = load_manifest_section_numbers(manifest_csv)
+    thickness_per_section = load_manifest_thickness(manifest_csv)
+    if spacing_um is None:
+        if section_numbers is not None or None in thickness_per_section:
+            warnings.warn(
+                f"section_thickness_um and sampling_interval not given; placing "
+                f"consecutive sections {voxel_um} um apart, the voxel size. Pass "
+                f"both to place sections at their physical z.",
+                stacklevel=2,
+            )
+        spacing_um = voxel_um
+    else:
+        listed = sorted({t for t in thickness_per_section if t is not None})
+        if any(not np.isclose(t, spacing_um) for t in listed):
+            raise ValueError(
+                f"Manifest thickness_um {listed} disagrees with the section "
+                f"spacing, {section_thickness_um} um x every "
+                f"{int(sampling_interval)} = {spacing_um} um. The column is the "
+                f"distance between consecutive manifest rows; mark removed "
+                f"sections with a section_number column instead."
+            )
+    section_z_um = _section_z_um(section_numbers, thickness_per_section, spacing_um)
+
+    # Place sections on the uniform z grid; gaps become empty placeholders
+    # rather than being closed up.
+    sources = _plane_sources(section_z_um, voxel_um)
+    has_section = sources >= 0
+    vol = np.zeros((len(sources), *stack.shape[1:]), dtype=np.uint8)
+    vol[has_section] = stack[sources[has_section]]
+    if not has_section.all():
+        empty_z = (np.flatnonzero(~has_section) * voxel_um).tolist()
+        warnings.warn(
+            f"{len(empty_z)} of {len(sources)} z-planes have no section within "
+            f"half a pitch and are left empty (z = {empty_z[:10]} um"
+            f"{' ...' if len(empty_z) > 10 else ''}); see sdata.attrs['z_planes'].",
+            stacklevel=2,
+        )
 
     # Index (z_idx, y_idx, x_idx) -> microns (z_um, y_um, x_um). Isotropic:
-    # every axis scales by target_voxel_um. The z-row's scale is ALWAYS
-    # target_voxel_um -- it deliberately ignores thickness_um; see
-    # 05-CONTEXT.md's "Scope amendment" for why a single linear Affine
-    # cannot (and should not, per that decision) encode variable thickness.
+    # every axis scales by voxel_um; sections were placed on this z grid at
+    # their physical z above.
     matrix = np.array([
-        [target_voxel_um, 0.,               0.,               0.],  # z_um = target_voxel_um * z_idx (always uniform, ignores thickness_um by design)
-        [0.,               target_voxel_um, 0.,               0.],  # y_um = target_voxel_um * y_idx
-        [0.,               0.,               target_voxel_um, 0.],  # x_um = target_voxel_um * x_idx
-        [0.,               0.,               0.,               1.],
+        [voxel_um, 0.,       0.,       0.],  # z_um = voxel_um * z_idx
+        [0.,       voxel_um, 0.,       0.],  # y_um = voxel_um * y_idx
+        [0.,       0.,       voxel_um, 0.],  # x_um = voxel_um * x_idx
+        [0.,       0.,       0.,       1.],
     ])
     affine = Affine(matrix, input_axes=("z", "y", "x"), output_axes=("z", "y", "x"))
 
@@ -252,14 +440,18 @@ def build_volume(
     tables: dict[str, object] = {}
 
     if nuclear_features is not None:
-        if transforms is None:
+        needs_affine = any(
+            not _REGISTERED_COLUMNS.issubset(df.columns)
+            for df in nuclear_features.values()
+        )
+        if needs_affine and transforms is None:
             raise ValueError(
                 "transforms must be provided when nuclear_features is "
                 "given -- nuclear centroids require the section's full "
                 "rigid Affine to reach microns_3d (RESEARCH.md Pitfall 2: "
                 "never the label's scale-only convention)."
             )
-        if level0_mpp is None or registration_mpp is None:
+        if needs_affine and (level0_mpp is None or registration_mpp is None):
             raise ValueError(
                 "level0_mpp and registration_mpp must both be provided "
                 "when nuclear_features is given -- required to rescale "
@@ -267,22 +459,13 @@ def build_volume(
                 "grid."
             )
 
-        # NUCLEAR z ONLY: cumulative-thickness placement from the optional
-        # manifest thickness_um column (falls back to uniform
-        # target_voxel_um when absent) -- 05-CONTEXT.md's "Scope amendment".
-        # This is deliberately separate from the label z-affine above,
-        # which is unconditionally uniform and never reads thickness_um.
-        thickness_per_section = load_manifest_thickness(manifest_csv)
-        z_um_per_section = _cumulative_z_from_thickness(
-            thickness_per_section, default=target_voxel_um
-        )
-
         # Smoothing (Plan 05-03 Task 3): rebuild each section's transform
         # from z-smoothed in-plane parameters when smooth_z_sigma > 0;
         # otherwise use transforms unchanged. Ordered by INTEGER section
         # index (enumerate(paths)), never by path string.
-        working_transforms = _smoothed_section_transforms(
-            paths, transforms, smooth_z_sigma
+        working_transforms = (
+            _smoothed_section_transforms(paths, transforms, smooth_z_sigma)
+            if needs_affine else {}
         )
 
         per_section_frames: dict[int, pd.DataFrame] = {}
@@ -295,17 +478,24 @@ def build_volume(
                     f"every manifest row when supplied."
                 )
             feats = nuclear_features[key]
-            centroids = feats[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float64)
-            zyx = _transform_centroids_to_microns(
-                centroids, working_transforms[key], level0_mpp, registration_mpp
-            )
+            if _REGISTERED_COLUMNS.issubset(feats.columns):
+                # Already in the registered canvas, through the same rigid +
+                # elastic warp as the label maps.
+                reg_yx = feats[["reg_y_um", "reg_x_um"]].to_numpy(dtype=np.float64)
+                zyx = np.column_stack([np.zeros(len(reg_yx)), reg_yx])
+            else:
+                # Rigid-only fallback: misses the elastic field the label maps
+                # were warped with, so nuclei can sit off their labels by the
+                # local elastic displacement.
+                centroids = feats[["centroid_y", "centroid_x"]].to_numpy(dtype=np.float64)
+                zyx = _transform_centroids_to_microns(
+                    centroids, working_transforms[key], level0_mpp, registration_mpp
+                )
             # NUCLEAR z OVERRIDE: discard the affine-derived z (which comes
-            # from registration.py's own z convention and need not equal
-            # the manifest thickness) and write the cumulative-thickness
-            # value for this section instead. Keep only y, x from the
-            # affine (see module docstring's "Deliberate scoping choice").
+            # from registration.py's own z convention) and use the section's
+            # physical z, the same z its label map was placed at.
             zyx = zyx.copy()
-            zyx[:, 0] = z_um_per_section[k]
+            zyx[:, 0] = section_z_um[k]
 
             df = feats.copy()
             df["z_um"] = zyx[:, 0]
@@ -324,6 +514,15 @@ def build_volume(
         tables["nuclei"] = nuclei_table(merged)
 
     sdata = SpatialData(labels={"tissue_labels": labels_el}, tables=tables)
+    sdata.attrs["z_planes"] = {
+        "z_um": (np.arange(len(sources)) * voxel_um).tolist(),
+        "section_index": [int(i) for i in sources],
+    }
+    sdata.attrs["voxel"] = {
+        "voxel_um": voxel_um,
+        "section_thickness_um": section_thickness_um,
+        "sampling_interval": None if sampling_interval is None else int(sampling_interval),
+    }
 
     if output_path is not None:
         sdata.write(str(output_path))
@@ -372,6 +571,174 @@ def nuclei_table(merged: pd.DataFrame):
         region="tissue_labels",
         region_key="region",
         instance_key="instance_id",
+    )
+
+
+def _read_label_png(path: Path) -> np.ndarray:
+    """Read one of the pipeline's own label-map PNGs.
+
+    A section at 0.5 um/px is ~730 MP, past Pillow's decompression-bomb
+    ceiling (which raises above 2x its limit), so the guard is lifted for the
+    read and restored afterwards.
+    """
+    from PIL import Image
+
+    previous = Image.MAX_IMAGE_PIXELS
+    Image.MAX_IMAGE_PIXELS = None
+    try:
+        with Image.open(path) as im:
+            return np.array(im)
+    finally:
+        Image.MAX_IMAGE_PIXELS = previous
+
+
+def build_volume_from_run(
+    run_dir: str | Path,
+    *,
+    manifest_csv: str | Path | None = None,
+    target_voxel_um: float | None = None,
+    section_thickness_um: float | None = None,
+    sampling_interval: int | None = None,
+    include_nuclei: bool = True,
+    output_path: str | Path | None = None,
+    nuclear_parquet_path: str | Path | None = None,
+    smooth_z_sigma: float = 0.0,
+):
+    """Build the 3D volume from what ``pipeline.run_pipeline`` wrote to disk.
+
+    Reads ``label_maps/{idx:04d}_labels.png``, ``nuclei/{idx:04d}_nuclei.csv``,
+    ``section_transforms.pkl`` and ``volume_build_metadata.json`` from
+    ``run_dir``, so a volume can be built (or rebuilt at another voxel size)
+    without re-registering or re-segmenting. Each label map is downsampled as
+    it is read and then released: all 149 sections of a real stack at 0.5
+    um/px would need ~109 GB, while at 8 um the stack is ~0.4 GB.
+
+    Nuclei CSVs written by ``run_pipeline`` carry ``reg_y_um``/``reg_x_um``
+    (VALIS's full warp). Older run directories lack them, so their nuclei
+    fall back to the rigid Affine in ``section_transforms.pkl``, which omits
+    the elastic field.
+
+    Args:
+        run_dir: pipeline output directory.
+        manifest_csv: manifest defining section order. Defaults to the one
+            recorded in the metadata JSON. Its ``path`` column only serves as
+            dict keys, so a copy holding cluster paths works off-cluster.
+        target_voxel_um: isotropic output resolution, microns, used only
+            without ``section_thickness_um``/``sampling_interval``; see
+            ``build_volume``.
+        section_thickness_um, sampling_interval: thickness each section was
+            cut at (microns) and every how many cut sections one was imaged.
+            Together they set the section spacing and the voxel size, as in
+            ``build_volume``. When neither is given, the values the run
+            recorded in its metadata JSON are used, if it recorded both.
+        include_nuclei: False builds a labels-only volume.
+        output_path: if given, the SpatialData zarr is written here.
+        nuclear_parquet_path: if given, the merged nuclear table is written here.
+        smooth_z_sigma: forwarded to ``build_volume``. Default ``0.0`` (off),
+            as there.
+
+    Returns:
+        The ``SpatialData`` container from ``build_volume``.
+
+    Raises:
+        FileNotFoundError: ``run_dir`` or the transforms pickle is missing.
+        ValueError: no manifest is available; a section has no label map
+            (or, with ``include_nuclei``, no nuclei CSV), since a missing file
+            would silently drop a section; or the thickness, interval and
+            voxel size disagree (see ``build_volume``).
+    """
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        raise FileNotFoundError(f"Run directory not found: {run_dir}")
+
+    metadata_path = run_dir / "volume_build_metadata.json"
+    metadata: dict = {}
+    if metadata_path.exists():
+        with open(metadata_path) as f:
+            metadata = json.load(f)
+
+    manifest_csv = manifest_csv or metadata.get("manifest_csv")
+    if manifest_csv is None:
+        raise ValueError(
+            f"No manifest_csv given and none recorded in {metadata_path}."
+        )
+    manifest_csv = Path(manifest_csv)
+
+    transforms_path = run_dir / metadata.get("transforms_pickle", "section_transforms.pkl")
+    if not transforms_path.exists():
+        raise FileNotFoundError(f"Transforms pickle not found: {transforms_path}")
+    label_maps_dir = run_dir / metadata.get("label_maps_dir", "label_maps")
+    nuclei_dir = run_dir / metadata.get("nuclei_dir", "nuclei")
+
+    section_mpp = float(metadata.get("seg_mpp", 0.5))
+    level0_mpp = metadata.get("level0_mpp")
+    registration_mpp = float(metadata.get("registration_mpp", 8.0))
+
+    # Runs written before sampling_interval was recorded stored the z spacing
+    # under section_thickness_um, so the metadata is used only when it has both.
+    if section_thickness_um is None and sampling_interval is None:
+        recorded = (metadata.get("section_thickness_um"), metadata.get("sampling_interval"))
+        if None not in recorded:
+            section_thickness_um, sampling_interval = recorded
+    voxel_um, _ = _resolve_voxel_um(
+        target_voxel_um, section_thickness_um, sampling_interval
+    )
+
+    paths = load_manifest(manifest_csv)
+
+    label_maps: dict[str, np.ndarray] = {}
+    missing: list[int] = []
+    for i, path in enumerate(paths):
+        png = label_maps_dir / f"{i:04d}_labels.png"
+        if not png.exists():
+            missing.append(i)
+            continue
+        label_maps[str(path)] = _downsample_label_stack(
+            _read_label_png(png), section_mpp, voxel_um
+        )
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(paths)} sections have no label map in "
+            f"{label_maps_dir}: section indices {missing}."
+        )
+
+    nuclear_features: dict[str, pd.DataFrame] | None = None
+    if include_nuclei:
+        nuclear_features = {}
+        missing_nuclei: list[int] = []
+        for i, path in enumerate(paths):
+            csv_path = nuclei_dir / f"{i:04d}_nuclei.csv"
+            if not csv_path.exists():
+                missing_nuclei.append(i)
+                continue
+            nuclear_features[str(path)] = pd.read_csv(csv_path)
+        if missing_nuclei:
+            raise ValueError(
+                f"{len(missing_nuclei)} of {len(paths)} sections have no nuclei "
+                f"CSV in {nuclei_dir}: section indices {missing_nuclei}. Pass "
+                f"include_nuclei=False for a labels-only volume."
+            )
+
+    # Only ever loaded from the run's own directory: unpickling executes code.
+    with open(transforms_path, "rb") as f:
+        transforms = pickle.load(f)
+
+    # The label maps are already at voxel_um, so section_mpp is set to match
+    # and build_volume's own resize is an identity, not a second pass.
+    return build_volume(
+        manifest_csv,
+        label_maps,
+        transforms=transforms,
+        nuclear_features=nuclear_features,
+        target_voxel_um=target_voxel_um,
+        section_thickness_um=section_thickness_um,
+        sampling_interval=sampling_interval,
+        section_mpp=voxel_um,
+        level0_mpp=level0_mpp,
+        registration_mpp=registration_mpp,
+        output_path=output_path,
+        nuclear_parquet_path=nuclear_parquet_path,
+        smooth_z_sigma=smooth_z_sigma,
     )
 
 

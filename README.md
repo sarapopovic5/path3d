@@ -10,18 +10,196 @@ Based on the original [CODA](https://github.com/ashleylk/CODA) pipeline (Kiemen 
 pip install path3d
 ```
 
-Optional extras:
+That is the whole pipeline — slide I/O, CZI support, registration, segmentation,
+nuclear detection, volume assembly and quantification. Two things are left out, because each one
+breaks an install target the other needs:
 
 ```bash
-pip install "path3d[czi]"            # Zeiss CZI support
-pip install "path3d[registration]"   # serial section registration (VALIS)
-pip install "path3d[viz]"            # interactive 3D viewing (napari)
-pip install "path3d[niches]"         # 3D Xenium tissue neighbourhoods from H&E
-pip install "path3d[all]"            # everything
+pip install "path3d[binaries]"   # bundled openslide + libvips, no system install
+pip install "path3d[viz]"        # interactive 3D viewing (napari + Qt)
+pip install "path3d[niches]"     # 3D Xenium tissue neighbourhoods from H&E
+pip install "path3d[all]"        # all of the above
 ```
 
-The `registration` extra requires a Java runtime (VALIS uses Bio-Formats).
-`openslide` and `libvips` are bundled as pip wheels — no system install needed.
+Registration requires a Java runtime (VALIS uses Bio-Formats).
+
+`path3d` needs the OpenSlide and libvips native libraries. On a desktop the
+`binaries` extra supplies both as pip wheels, so nothing has to be installed
+system-wide. Where those libraries already exist, provide them instead of
+installing the extra: it ships wheels only for mainstream platforms, and
+elsewhere pip tries to compile them from source and fails.
+
+`viz` is separate because it pulls in PyQt5 and the whole Qt5 runtime, which is
+dead weight on a headless compute node.
+
+### HPC clusters
+
+On a cluster, run path3d from an Apptainer image instead of a venv. The image is
+self-contained: Python 3.10, a JRE for VALIS, and the libvips and OpenSlide
+builds from `[binaries]`. It covers preprocessing, registration, segmentation,
+nuclear detection, volume assembly and quantification. Visualization is left
+out and runs locally.
+
+The steps below follow the Alliance's
+[Apptainer page](https://docs.alliancecan.ca/wiki/Apptainer) and are written for
+[Nibi](https://docs.alliancecan.ca/wiki/Nibi), where every node, compute nodes
+included, has internet access. Keep the checkout and your data under `/project`
+or `/scratch`: those are the filesystems bound into the container, and `/home`
+deliberately is not.
+
+**Build** inside an interactive job, not on a login node. Apptainer's cache and
+temp directories must be on non-networked disk, so they go in the job's local
+`$SLURM_TMPDIR`. `APPTAINER_BIND=' '` stops host paths being mounted during the
+build. Run this from the repo root:
+
+```bash
+salloc --account=<def-xxx> --time=1:00:00 --cpus-per-task=4 --mem=16G
+module load apptainer
+export APPTAINER_CACHEDIR=$SLURM_TMPDIR/apptainer/cache APPTAINER_TMPDIR=$SLURM_TMPDIR/apptainer/tmp
+mkdir -p $APPTAINER_CACHEDIR $APPTAINER_TMPDIR
+APPTAINER_BIND=' ' apptainer build path3d.sif hpc/path3d.def
+```
+
+The build runs the image's self-test at the end. It reports
+`cuda_available=False` because the job has no GPU, which is expected. To check
+CUDA, run `apptainer test --nv path3d.sif` in a GPU job.
+
+**Run** with the options the Alliance recommends. `-C` isolates the container
+from the host environment. `-W $SLURM_TMPDIR` keeps temp files on local disk
+rather than RAM. `-B` binds `/project` and `/scratch`, and `--nv` exposes the
+GPU. `--home` points at a directory you create once. The pipeline's download
+caches live there and persist between jobs: Hugging Face, Cellpose weights,
+and the Bio-Formats jars VALIS fetches. It also holds your Hugging Face token,
+so keep it private, in your own `$HOME` rather than a group `/project` space.
+Only that one directory is mounted, not the rest of `$HOME`, and the caches
+come to about 4 GB. Under `-C` the container starts in that home directory rather than
+where you ran it, so `--pwd "$(pwd -P)"` is needed for relative paths to resolve.
+The `-P` matters: `~/projects/<def-xxx>` is a symlink into `/project`, and the
+`/home/...` spelling of the path does not exist inside the container.
+
+```bash
+P3HOME=$HOME/path3d-home   # once: mkdir -p $P3HOME && chmod 700 $P3HOME
+apptainer run -C --nv -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd "$(pwd -P)" \
+    path3d.sif scripts/run_full.py ...
+```
+
+Nibi already binds `/project` and `/scratch` into every container, so there
+the `-B` options only produce a harmless "destination is already in the mount
+point list" warning. They are kept for clusters that do not.
+
+UNI2-h is gated, so log in to Hugging Face once. The token is stored in
+`$P3HOME`. Optionally, pre-fetch the models too, so that parallel jobs don't
+each download them on first use:
+
+```bash
+A="apptainer run -C -W $SLURM_TMPDIR -B /project -B /scratch --home $P3HOME --pwd "$(pwd -P)" path3d.sif"
+$A -c "from huggingface_hub import login; login()"
+$A -c "from huggingface_hub import hf_hub_download as d; d('MahmoodLab/UNI2-h', 'pytorch_model.bin')"
+$A -c "from cellpose import models; models.CellposeModel(gpu=False, pretrained_model='cpsam_v2')"
+$A -c "from valis import registration as r; r.init_jvm(); r.kill_jvm()"
+```
+
+The image contains a snapshot of `src/`. To run a live checkout without
+rebuilding, add `--env PYTHONPATH="$(pwd -P)/src"` and run from the checkout root.
+Rebuild the image whenever the
+dependencies change. `hpc/container-constraints.txt` holds the version pins,
+and the image records its full resolved set in `/opt/path3d/pip-freeze.txt`.
+
+### Staged run on Slurm
+
+A whole block in one job spends most of its time on one section after another:
+warping, segmenting and Cellpose for each in turn, with the GPU idle through
+registration. `scripts/slurm/` splits the run into three chained jobs instead,
+and spreads the per-section work over a GPU array:
+
+| Stage | Job | Does |
+|-------|-----|------|
+| 1 `register` | CPU | VALIS over the whole stack; saves the registration and the run's settings |
+| 2 `sections` | GPU array, `N_TASKS` tasks | Each task reloads the registration and warps, segments and detects nuclei in every `N_TASKS`-th section |
+| 3 `volume` | CPU | The 3D volume and quantification report, once every task has succeeded |
+
+Copy `scripts/slurm/hpc.env.example` to `local/hpc.env`, fill it in, and from
+the checkout root:
+
+```bash
+bash scripts/slurm/submit_all.sh local/hpc.env
+```
+
+Each array task runs on one H100 3g.40gb MIG slice by default (`GPU` in the env
+file), with the cores and memory Nibi recommends for that slice, so ten tasks
+are billed about as much as five full GPUs. A job may hold only one MIG slice,
+which is why the work is spread over an array rather than several GPUs per job.
+Each task's log starts with the slice it got (`nvidia-smi -L`).
+
+Logs go to `$OUTDIR/logs/`. The outputs are the same files a single-process run
+writes. Stages 2 and 3 take the manifest, resolutions and section spacing from
+what stage 1 recorded, so the stages cannot disagree.
+
+If an array task fails or times out, Slurm never starts the volume job, which
+then stays pending with reason `DependencyNeverSatisfied`. Cancel it and submit
+again from stage 2. Sections already on disk are skipped, so only the
+unfinished ones are redone:
+
+```bash
+scancel <volume job id>
+bash scripts/slurm/submit_all.sh local/hpc.env sections
+```
+
+### Development environment (conda)
+
+`environment.yml` builds an env with every extra installed and a bundled JDK,
+so VALIS registration works without a system Java:
+
+```bash
+conda env create -f environment.yml
+conda activate path3d
+```
+
+Python dependencies are not duplicated in `environment.yml` — it installs the
+project with `pip install -e .[all,dev]`, so `pyproject.toml` stays the single
+source of truth.
+
+## Outputs
+
+`scripts/run_full.py` runs every stage in order and writes into `--out`:
+
+| Path | Contents |
+|------|----------|
+| `label_maps/`, `nuclei/` | Per-section tissue label maps and nuclei tables, written as each section finishes |
+| `section_transforms.pkl`, `volume_build_metadata.json` | Registration transforms and the scalars needed to rebuild the volume |
+| `volume_{voxel}um.zarr` | The 3D SpatialData volume: tissue labels plus the nuclei table |
+| `nuclei_{voxel}um.parquet` | All nuclei, with 3D coordinates in microns |
+| `quantification/report.md` | Readable summary of the quantification, alongside its CSV/parquet tables |
+
+The run never opens a viewer. Copy the output directory to a desktop and view it there:
+
+```python
+from path3d.visualization import view_volume
+view_volume("run_out/volume_8um.zarr")
+```
+
+To rebuild the volume, or quantify it again, from a finished output directory
+without re-running registration or segmentation:
+
+```python
+from path3d.volume import build_volume_from_run
+from path3d.quantification import run_quantification
+
+# 4 um sections, every second one stained: sections 8 um apart, 8 um voxels
+sdata = build_volume_from_run(
+    "run_out",
+    section_thickness_um=4.0,
+    sampling_interval=2,
+    output_path="run_out/volume_8um.zarr",
+)
+run_quantification(
+    sdata, "run_out/quantification", voxel_um=8.0,
+    section_thickness_um=4.0, sampling_interval=2,
+)
+```
+
+Pass `--section-thickness-um` and `--sampling-interval` to `run_full.py` too; the
+run records them, so `build_volume_from_run` reuses them when given neither.
 
 ### Development environment (conda)
 
@@ -47,12 +225,6 @@ source of truth.
 | Leica SCN | `.scn` | openslide |
 | 3DHISTECH MRXS | `.mrxs` | openslide |
 | Zeiss CZI | `.czi` | aicspylibczi *(optional)* |
-
-## Conventions
-
-- Coordinates are 0-based; 2D is `(row, col)` = `(y, x)`, 3D is `(z, row, col)`
-- Physical units are microns
-- `read_region` always returns `(H, W, 3)` uint8 RGB — alpha is stripped
 
 ## 3D tissue neighbourhoods
 
@@ -87,10 +259,6 @@ resolution, z-pitch and argmax decisions the 3D path adds.
 Requires Hugging Face access to the gated
 [`MahmoodLab/UNI2-h`](https://huggingface.co/MahmoodLab/UNI2-h) (request access,
 then `hf auth login`).
-
-## Documentation
-
-See [`docs/`](docs/) for the pipeline overview, algorithm notes, and references.
 
 ## Tests
 

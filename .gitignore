@@ -69,3 +69,6 @@ pyrightconfig.json
 # ─── Local planning notes ─────────────────────────────────────────────────────
 .planning/
 notes/
+
+# Apptainer images
+*.sif

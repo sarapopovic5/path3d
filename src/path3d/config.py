@@ -2,7 +2,7 @@
 
 TISSUE_CLASSES maps organ name → {class_index: name}. can add multiple tissue types
 
-Also holds the default resolution constants (SEG_MPP, REG_MPP) and the
+Also holds the default resolution constants (SEG_MPP, REG_MPP, VOXEL_UM) and the
 default tissue-mask grayscale cutoff (TISSUE_GRAY_THRESHOLD) shared across
 the pipeline
 
@@ -16,6 +16,14 @@ import numpy as np
 
 SEG_MPP = 0.5   # segmentation and nuclear-detection working resolution, um/px
 REG_MPP = 8.0   # elastic serial-section registration resolution, um/px
+VOXEL_UM = 8.0  # isotropic 3D volume and quantification resolution, um/voxel
+
+# Resolution the segmentation checkpoints were TRAINED at. Every patch in
+# training_data_v2's patch_manifest.csv has downsample=2.0 from CZIs whose
+# level 0 is ~0.2201 um/px, i.e. 448 px patches at ~0.4402 um/px (~197 um
+# field of view). predict_section sizes its tiles so the encoder sees this
+# same um/px; change it if a model is retrained at another resolution.
+SEG_TRAIN_MPP = 0.4402
 
 # Fixed grayscale cutoff for preprocessing.make_tissue_mask, in [0, 1] on an
 # rgb2gray float image (True = background when gray > threshold). Replaces a
