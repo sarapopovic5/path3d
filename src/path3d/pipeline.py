@@ -31,6 +31,11 @@ import path3d.config as cfg
 # against the same registered images.
 _MASK_MPP = 2.0
 
+# segment_first tolerance: a source pyramid level counts as the training
+# resolution when it is at most this much coarser than cfg.SEG_TRAIN_MPP
+# (CZI level 1 is 0.44035 um/px against the 0.4402 the checkpoint saw).
+_TRAIN_LEVEL_TOL = 0.01
+
 
 # DATA FLOW: one slide is open at a time so as to not overload RAM
 
@@ -60,6 +65,64 @@ def run_section(slide: io.SlideReader, section_index: int) -> dict:
     results["level0_shape_rc"] = (int(level0_h), int(level0_w))
 
     return results
+
+
+def _training_level_mpp(slide: io.SlideReader, train_mpp: float = cfg.SEG_TRAIN_MPP) -> float:
+    """Resolution (µm/px) of the coarsest pyramid level of ``slide`` that is
+    still no coarser than ``train_mpp`` (1% tolerance), so segmenting there
+    shows the model tissue at the scale it was trained on without upsampling.
+
+    For the pilot CZIs (0.22017 µm/px, 2x levels) this is level 1, 0.44035
+    µm/px: the exact level the training patches were read from.
+    """
+    mpp0 = slide.get_mpp()
+    limit = train_mpp * (1 + _TRAIN_LEVEL_TOL)
+    best = 0
+    for level, ds in enumerate(slide.level_downsamples):
+        if mpp0 * ds <= limit:
+            best = level
+    return mpp0 * slide.level_downsamples[best]
+
+
+def _save_label_png(label_map: np.ndarray, path: Path) -> Path:
+    """Write a uint8 label PNG under a temporary name, then rename it, so a
+    killed job never leaves a truncated file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    Image.fromarray(label_map.astype(np.uint8)).save(tmp_path, format="PNG")
+    tmp_path.replace(path)
+    return path
+
+
+def _segment_raw_section(
+    path: Path,
+    seg_model_obj,
+    *,
+    num_classes: int,
+    section_idx: int,
+    seg_device: str,
+) -> tuple[np.ndarray, float]:
+    """Segment one ORIGINAL (unregistered) slide at the training resolution.
+
+    The tissue mask comes from the same slide, so it never sees the canvas
+    fill a registered image has around the section.
+
+    Returns:
+        ((H, W) uint8 label map covering the whole slide, its µm/px).
+    """
+    with io.open_slide(path) as slide:
+        raw_mpp = _training_level_mpp(slide)
+        tissue_mask = pr.make_tissue_mask(pr.downsample_to_mpp(slide, _MASK_MPP))
+    label_map = sg.predict_section(
+        path,
+        seg_model_obj,
+        tissue_mask,
+        num_classes=num_classes,
+        section_idx=section_idx,
+        seg_mpp=raw_mpp,
+        device=seg_device,
+    )
+    return label_map.astype(np.uint8), raw_mpp
 
 
 def _write_section_outputs(
@@ -96,10 +159,7 @@ def _write_section_outputs(
         label_map_dir.mkdir(parents=True, exist_ok=True)
 
         label_map_u8 = label_map.astype(np.uint8)
-        label_map_path = label_map_dir / f"{idx:04d}_labels.png"
-        tmp_path = label_map_path.with_name(label_map_path.name + ".tmp")
-        Image.fromarray(label_map_u8).save(tmp_path, format="PNG")
-        tmp_path.replace(label_map_path)
+        label_map_path = _save_label_png(label_map_u8, label_map_dir / f"{idx:04d}_labels.png")
         written["label_map_path"] = label_map_path
 
         palette = cfg.TISSUE_CLASS_COLORS[tissue_type]
@@ -222,8 +282,9 @@ def _write_volume_build_inputs(
     sampling_interval: int | None,
     do_non_rigid: bool,
     tissue_type: str,
+    segment_first: bool = False,
 ) -> None:
-    """Persist registration transforms + volume-build scalars 
+    """Persist registration transforms + volume-build scalars
 
     Writes two files under ``output_dir`` so a later, separate process can
     call ``volume.build_volume()`` from the label-map PNGs and nuclei CSVs
@@ -257,6 +318,8 @@ def _write_volume_build_inputs(
             them when it is not given its own.
         do_non_rigid: Whether elastic refinement was run, for provenance.
         tissue_type: Key into cfg.TISSUE_CLASSES, for provenance.
+        segment_first: Whether sections are segmented before registration
+            (see ``run_pipeline``). The sections stage reads it back.
 
     Note:
         ``section_transforms.pkl`` is only safe to load from a trusted run
@@ -282,6 +345,7 @@ def _write_volume_build_inputs(
         "sampling_interval": sampling_interval,
         "do_non_rigid": do_non_rigid,
         "tissue_type": tissue_type,
+        "segment_first": segment_first,
         "n_sections": len(slide_paths),
         "transforms_pickle": "section_transforms.pkl",
         "label_maps_dir": "label_maps",
@@ -361,6 +425,7 @@ def _register_stack(
     sampling_interval: int | None,
     tissue_type: str,
     strict: bool,
+    segment_first: bool = False,
 ) -> tuple[dict[int, object], list[dict]]:
     """Per-slide tissue masks, then VALIS over the whole stack, then the
     volume-build inputs (transforms + metadata) on disk.
@@ -409,6 +474,7 @@ def _register_stack(
             sampling_interval=sampling_interval,
             do_non_rigid=do_non_rigid,
             tissue_type=tissue_type,
+            segment_first=segment_first,
         )
         print(
             f"[INFO] Wrote {output_dir / 'section_transforms.pkl'} and "
@@ -437,12 +503,19 @@ def _process_section(
     reg_mpp: float,
     do_non_rigid: bool,
     tissue_type: str,
+    segment_first: bool = False,
 ) -> None:
     """Warp, segment and detect nuclei in one section, write its outputs and
     release them from ``result`` (mutated in place).
 
     ``result`` needs 'section_index' and 'level0_shape_rc'. ``valis_slide`` is
     the section's VALIS slide object, or None if registration dropped it.
+
+    With ``segment_first`` the ORIGINAL slide is segmented at the training
+    resolution, the raw label map is kept under ``label_maps_raw/``, and it is
+    warped (nearest-neighbour) onto the registered canvas, so
+    ``label_maps/`` holds the same frame either way. Otherwise the registered
+    OME-TIFF is segmented, as before.
     """
     idx = result["section_index"]
     registered_dir = output_dir / "registered"
@@ -451,7 +524,29 @@ def _process_section(
     if persist_nuclei_masks:
         nuclei_dir.mkdir(parents=True, exist_ok=True)
 
-    # Warp the section straight from its original slide to seg_mpp and save for segmentation
+    if segment_first and seg_model_obj is not None:
+        assert num_classes is not None
+        raw_labels, raw_mpp = _segment_raw_section(
+            path,
+            seg_model_obj,
+            num_classes=num_classes,
+            section_idx=idx,
+            seg_device=seg_device,
+        )
+        _save_label_png(raw_labels, output_dir / "label_maps_raw" / f"{idx:04d}_labels.png")
+        result["raw_label_mpp"] = raw_mpp
+        if valis_slide is not None:
+            result["label_map"] = reg.warp_label_map_to_registered(
+                valis_slide,
+                raw_labels,
+                reg_mpp=reg_mpp,
+                target_mpp=seg_mpp,
+                non_rigid=do_non_rigid,
+            )
+        del raw_labels
+
+    # Warp the section straight from its original slide to seg_mpp: the
+    # registered H&E, segmented here unless segment_first already did it
     if valis_slide is None:
         result["registered_path"] = None
     else:
@@ -467,7 +562,7 @@ def _process_section(
 
         # Segmentation runs before nuclear detection so it always gets clean GPU state
 
-        if seg_model_obj is not None:
+        if seg_model_obj is not None and not segment_first:
             # num_classes is always set to an int alongside seg_model_obj
             # in _load_seg_model -- assert narrows it for the type checker
             assert num_classes is not None
@@ -586,6 +681,7 @@ def run_pipeline(
     voxel_um: float | None = None,
     section_thickness_um: float | None = None,
     sampling_interval: int | None = None,
+    segment_first: bool = False,
 ) -> list[dict]:
     """Run the full pipeline over all sections in the manifest, through the 3D
     volume and its quantification report.
@@ -630,6 +726,13 @@ def run_pipeline(
             the voxel size (4 µm x 2 = 8 µm voxels), and the stereological
             count correction. Without them, the correction treats sections
             as ``voxel_um`` thick with every one imaged.
+        segment_first: Segment each ORIGINAL slide at the training
+            resolution (the pyramid level nearest ``cfg.SEG_TRAIN_MPP``),
+            then warp its label map nearest-neighbour onto the registered
+            canvas, instead of segmenting the registered OME-TIFF. The raw
+            label maps are kept in output_dir/label_maps_raw/. Registration
+            itself, the registered H&E, nuclei, the volume and its
+            quantification are unchanged.
 
     Returns:
         List of per-section result dicts in section order. Each dict
@@ -686,6 +789,7 @@ def run_pipeline(
         sampling_interval=sampling_interval,
         tissue_type=tissue_type,
         strict=False,
+        segment_first=segment_first,
     )
 
     for result, path in zip(all_results, slide_paths):
@@ -703,6 +807,7 @@ def run_pipeline(
             reg_mpp=reg_mpp,
             do_non_rigid=do_non_rigid,
             tissue_type=tissue_type,
+            segment_first=segment_first,
         )
 
     _kill_jvm()
@@ -761,9 +866,10 @@ def run_register_stage(
     voxel_um: float | None = None,
     section_thickness_um: float | None = None,
     sampling_interval: int | None = None,
+    segment_first: bool = False,
 ) -> list[dict]:
     """Stage 1 of a staged run: register the stack and record the run's
-    settings. Arguments as for ``run_pipeline``.
+    settings, ``segment_first`` included. Arguments as for ``run_pipeline``.
 
     Raises:
         FileExistsError: the volume zarr already exists in ``output_dir``.
@@ -786,6 +892,7 @@ def run_register_stage(
         sampling_interval=sampling_interval,
         tissue_type=tissue_type,
         strict=True,
+        segment_first=segment_first,
     )
     _kill_jvm()
     return all_results
@@ -808,7 +915,9 @@ def run_sections_stage(
     Reloads the registration stage 1 saved. Sections whose outputs are already
     on disk are skipped, so a failed or timed-out task can simply be
     resubmitted. Model arguments as for ``run_pipeline``; the manifest,
-    tissue type, resolutions and do_non_rigid come from stage 1.
+    tissue type, resolutions, do_non_rigid and segment_first come from
+    stage 1 (runs registered before segment_first existed segment the
+    registered image, as they did then).
 
     Returns:
         Result dicts, as ``run_pipeline``'s, for the sections processed now.
@@ -852,6 +961,7 @@ def run_sections_stage(
             reg_mpp=meta["registration_mpp"],
             do_non_rigid=meta["do_non_rigid"],
             tissue_type=tissue_type,
+            segment_first=meta.get("segment_first", False),
         )
         results.append(result)
 

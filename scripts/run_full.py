@@ -79,6 +79,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="skip elastic refinement, rigid registration only",
     )
     parser.add_argument(
+        "--segment-first",
+        action="store_true",
+        help="segment each original slide at the training resolution, then "
+        "warp the label map onto the registered canvas, instead of segmenting "
+        "the registered image. The register stage records it; the sections "
+        "stage follows that record",
+    )
+    parser.add_argument(
         "--persist-nuclei-masks",
         action="store_true",
         help="write per-section instance masks to zarr (large)",
@@ -211,6 +219,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"stage:      {args.stage}", flush=True)
     print(f"output:     {output_dir}", flush=True)
+    if args.stage in ("all", "register"):
+        print(f"segment:    {'original slide, then warp labels' if args.segment_first else 'registered image'}",
+              flush=True)
 
     if args.stage == "sections":
         print(f"task:       {args.task_index} of {args.n_tasks}", flush=True)
@@ -269,6 +280,7 @@ def main(argv: list[str] | None = None) -> int:
                 voxel_um=voxel_um,
                 section_thickness_um=thickness_um,
                 sampling_interval=interval,
+                segment_first=args.segment_first,
             )
         except FileExistsError as exc:
             sys.exit(str(exc))
@@ -290,6 +302,7 @@ def main(argv: list[str] | None = None) -> int:
         voxel_um=voxel_um,
         section_thickness_um=thickness_um,
         sampling_interval=interval,
+        segment_first=args.segment_first,
     )
     _print_results(results)
     _print_report(output_dir)
