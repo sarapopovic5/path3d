@@ -19,6 +19,7 @@ shortest path, not a dedicated heat-method geodesic-mesh library.
 
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -408,14 +409,28 @@ def _component_hull_image(mask: np.ndarray) -> np.ndarray | None:
         `(z, y, x)` boolean hull image, or `None` when `mask` is too
         degenerate for `convex_hull_image` to build a hull (planar,
         collinear, or single-voxel).
+
+    skimage does not raise on a degenerate mask: it warns "Failed to get
+    convex hull image", with Qhull's whole multi-line report, and returns
+    an EMPTY image. That warning is silenced (a full block printed it ~900
+    times) and the empty image is turned into `None`, so degenerate
+    components take the corner-hull path for solidity instead of the
+    `area_convex == 0` fallback of 1.0.
     """
     from scipy.spatial import QhullError
     from skimage.morphology import convex_hull_image
 
     try:
-        return convex_hull_image(mask)
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", message="Failed to get convex hull image", category=UserWarning
+            )
+            hull = convex_hull_image(mask)
     except (ValueError, QhullError):
         return None
+    if mask.any() and not hull.any():
+        return None
+    return hull
 
 
 def _feret_degenerate_um(mask: np.ndarray, voxel_um: float) -> float:
