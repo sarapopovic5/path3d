@@ -15,7 +15,9 @@ or on Slurm as three chained jobs, with the GPU work split over an array::
 
 which runs ``--stage register``, then ``--stage sections`` once per array
 task, then ``--stage volume``. Later stages take the manifest and section
-spacing from what ``register`` recorded in --out.
+spacing from what ``register`` recorded in --out. With NICHES=1 it also runs
+``--stage niches`` (a second GPU array, beside ``sections``) and
+``--stage niches-volume``; in one process, ``--niches`` does the same.
 
 Omit --seg-model to skip segmentation inference entirely.
 """
@@ -117,25 +119,72 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--niches",
+        action="store_true",
+        help="with --stage all: also predict tissue neighbourhoods and build "
+        "the niche volume under OUT/neighbourhoods/ (the staged run uses "
+        "--stage niches and niches-volume instead)",
+    )
+    parser.add_argument(
+        "--niche-step-um",
+        type=float,
+        default=_env_default("NICHE_STEP_UM"),
+        help="spacing of niche tile centres, which is the niche volume's "
+        "in-plane grid. Env: NICHE_STEP_UM (default: the model's 32 um tile)",
+    )
+    parser.add_argument(
+        "--niche-voxel-um",
+        type=float,
+        default=_env_default("NICHE_VOXEL_UM"),
+        help="niche volume cube size: a whole multiple of the section spacing, "
+        "no coarser than the step. Env: NICHE_VOXEL_UM (default: the step)",
+    )
+    parser.add_argument(
+        "--niche-smooth-um",
+        type=float,
+        default=_env_default("NICHE_SMOOTH_UM") or 0.0,
+        help="in-plane Gaussian sigma on the niche probabilities, um. "
+        "Env: NICHE_SMOOTH_UM (default: 0, off)",
+    )
+    parser.add_argument(
+        "--niche-stride",
+        type=int,
+        default=1,
+        help="niches stage preview: every Nth tile per axis (use its own --out)",
+    )
+    parser.add_argument(
+        "--keep-niche-warp",
+        action="store_true",
+        help="keep registered_native/NNNN.ome.tiff after its niches are predicted",
+    )
+    parser.add_argument(
+        "--allow-missing-niches",
+        action="store_true",
+        help="niches-volume stage: build even if some sections have no prediction",
+    )
+
+    parser.add_argument(
         "--stage",
-        choices=("all", "register", "sections", "volume"),
+        choices=("all", "register", "sections", "volume", "niches", "niches-volume"),
         default="all",
         help="run everything in one process (all, the default), or one stage "
         "of a staged run: register (CPU), sections (GPU, this task's share), "
-        "volume (CPU, once every task has finished)",
+        "volume (CPU, once every task has finished), niches (GPU, this task's "
+        "share of the neighbourhood predictions), niches-volume (CPU, once "
+        "every niches task has finished)",
     )
     parser.add_argument(
         "--task-index",
         type=int,
         default=_env_default("SLURM_ARRAY_TASK_ID") or 0,
-        help="sections stage: which task this is, 0-based. "
+        help="sections/niches stage: which task this is, 0-based. "
         "Env: SLURM_ARRAY_TASK_ID (default: 0)",
     )
     parser.add_argument(
         "--n-tasks",
         type=int,
         default=_env_default("SLURM_ARRAY_TASK_COUNT") or 1,
-        help="sections stage: how many tasks share the sections. "
+        help="sections/niches stage: how many tasks share the sections. "
         "Env: SLURM_ARRAY_TASK_COUNT (default: 1)",
     )
 
@@ -253,6 +302,40 @@ def main(argv: list[str] | None = None) -> int:
         _print_report(output_dir)
         return 0
 
+    if args.stage == "niches":
+        print(f"task:       {args.task_index} of {args.n_tasks}", flush=True)
+        print(f"device:     {args.device}", flush=True)
+        try:
+            done = pl.run_niches_stage(
+                output_dir,
+                task_index=args.task_index,
+                n_tasks=args.n_tasks,
+                step_um=args.niche_step_um,
+                niche_voxel_um=args.niche_voxel_um,
+                voxel_um=args.voxel_um,
+                stride=args.niche_stride,
+                device=args.device,
+                keep_warp=args.keep_niche_warp,
+            )
+        except (FileNotFoundError, ValueError) as exc:
+            sys.exit(str(exc))
+        print(f"\n{len(done)} sections predicted: {done}", flush=True)
+        return 0
+
+    if args.stage == "niches-volume":
+        try:
+            path = pl.run_niches_volume_stage(
+                output_dir,
+                niche_voxel_um=args.niche_voxel_um,
+                voxel_um=args.voxel_um,
+                smooth_um=args.niche_smooth_um,
+                allow_missing=args.allow_missing_niches,
+            )
+        except (FileNotFoundError, RuntimeError, ValueError) as exc:
+            sys.exit(str(exc))
+        print(f"\nniche volume: {path}", flush=True)
+        return 0
+
     thickness_um, interval = args.section_thickness_um, args.sampling_interval
     try:
         voxel_um, _ = _resolve_voxel_um(
@@ -304,6 +387,10 @@ def main(argv: list[str] | None = None) -> int:
         section_thickness_um=thickness_um,
         sampling_interval=interval,
         segment_first=args.segment_first,
+        niches=args.niches,
+        niche_step_um=args.niche_step_um,
+        niche_voxel_um=args.niche_voxel_um,
+        niche_smooth_um=args.niche_smooth_um,
     )
     _print_results(results)
     _print_report(output_dir)

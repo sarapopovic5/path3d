@@ -117,6 +117,8 @@ and spreads the per-section work over a GPU array:
 | 1 `register` | CPU | VALIS over the whole stack; saves the registration and the run's settings |
 | 2 `sections` | GPU array, `N_TASKS` tasks | Each task reloads the registration and warps, segments and detects nuclei in every `N_TASKS`-th section |
 | 3 `volume` | CPU | The 3D volume and quantification report, once every task has succeeded |
+| 4 `niches` | GPU array, `NICHE_TASKS` tasks | With `NICHES=1`: warps each section again at native resolution (~0.22 µm/px, what the niche model was trained at) and predicts its tissue neighbourhoods. Needs only stage 1, so it runs beside stage 2 |
+| 5 `niches-volume` | CPU | The niche volume under `$OUTDIR/neighbourhoods/`, once stage 4 has succeeded, carrying stage 3's nuclei when they are there |
 
 Copy `scripts/slurm/hpc.env.example` to `local/hpc.env`, fill it in, and from
 the checkout root:
@@ -231,7 +233,13 @@ source of truth.
 `path3d.niches` predicts Xenium-derived tissue neighbourhoods
 (`epithelium | immune | stroma | acellular`) from H&E alone and stacks the
 per-section maps into a 3D volume, using path3d's registration to co-register
-the sections:
+the sections.
+
+The usual way to run it is as part of a pipeline run: `NICHES=1` in the Slurm
+env file (stages 4 and 5 above), or `scripts/run_full.py --niches` in one
+process. Either warps a native-resolution copy of each section for the niche
+model, since `registered/` is written at 0.5 µm/px, and deletes it once that
+section is predicted. On its own, after a run:
 
 ```python
 from path3d.niches import run_niche_pipeline

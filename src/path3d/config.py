@@ -25,6 +25,13 @@ VOXEL_UM = 8.0  # isotropic 3D volume and quantification resolution, um/voxel
 # same um/px; change it if a model is retrained at another resolution.
 SEG_TRAIN_MPP = 0.4402
 
+# Level-0 resolution the niche model (path3d.niches, UNI2-h) was trained at.
+# Its 112 um window is 509 px here and is resized to 224 px for the encoder,
+# so warping at SEG_MPP (0.5) would hand it ~1/5 of the detail it saw in
+# training. The staged run warps a second copy of each section for the niche
+# model at max(level-0 mpp, NICHE_TRAIN_MPP).
+NICHE_TRAIN_MPP = 0.2201
+
 # Fixed grayscale cutoff for preprocessing.make_tissue_mask, in [0, 1] on an
 # rgb2gray float image (True = background when gray > threshold). Replaces a
 # per-image Otsu fit that was measured flipping to a non-blob (precise) mask

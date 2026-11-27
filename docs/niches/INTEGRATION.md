@@ -124,14 +124,21 @@ network. path3d's default `cfg.SEG_MPP` is 0.5 µm/px, where the same window is
 **224 px** — the right physical size, but carrying roughly a fifth of the detail,
 with no resize happening at all.
 
-So pass `target_mpp=0.2201` (or whatever `CziReader.get_mpp()` reports) to
-`warp_and_save_section` for the niche pass. Check your own value — the model
-card is blunt that theirs need not be yours, and `_source_level_for_mpp` raises
-rather than upsample if you ask for finer than level 0.
+The pipeline's niche stage (`pipeline.run_niches_stage`, `--stage niches`,
+or `run_full.py --niches`) handles this for you. It warps each section a
+second time, at `max(level-0 mpp, cfg.NICHE_TRAIN_MPP)`, into
+`OUT/registered_native/`, predicts from that copy, and deletes it once the
+section's tiles are on disk (`--keep-niche-warp` keeps it). It does one section
+at a time, so each array task holds at most one native warp. `registered/`
+stays at 0.5 µm/px for the DPT segmentation, nuclei and viewing, so the
+existing runs and outputs are unchanged.
 
-One warp serves both consumers: the output is pyramidal, so
-`segmentation.predict_section` calling `best_level_for_mpp(0.5)` picks a
-~0.44 µm/px level off the same file. You do not need to warp twice.
+Running the niche model by hand on some other set of registered files? Warp
+them with `target_mpp=0.2201` (or whatever `CziReader.get_mpp()` reports).
+Check your own value — the model card is blunt that theirs need not be yours,
+and `_source_level_for_mpp` raises rather than upsample if you ask for finer
+than level 0. The 0.5 µm/px files in `registered/` give the encoder about a
+fifth of the detail it was trained on, and `niches.run` warns when it sees them.
 
 `tests/test_niches_ome_tiff.py` reports this as an `xfail` against whatever
 stack you point it at, naming the actual ratio.
