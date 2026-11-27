@@ -34,6 +34,32 @@ _TISSUE_3D_COLORS: dict[int, np.ndarray] = {
     4: np.array([0.95, 0.55, 0.10, 1.0]),  # Intraluminal secretion
 }
 
+# Per-tissue-type 3D palettes. ``_TISSUE_3D_COLORS`` above stays the HGSC
+# palette (and the fallback) so existing callers are unaffected; a niche
+# volume built by ``path3d.niches`` reuses the element name "tissue_labels"
+# but means something entirely different by each index, so it needs its own.
+_TISSUE_3D_COLORS_BY_TYPE: dict[str, dict[int, np.ndarray]] = {
+    "HGSC": _TISSUE_3D_COLORS,
+    # Matches config.TISSUE_CLASS_COLORS["HGSC_niches"] and the niche model
+    # card's own niche_maps.png, so 2D QC and 3D render agree.
+    "HGSC_niches": {
+        0: np.array([0.0, 0.0, 0.0, 0.0]),  # background -- fully transparent
+        1: np.array([0.482, 0.247, 0.616, 1.0]),  # epithelium  #7b3f9d
+        2: np.array([0.788, 0.333, 0.247, 1.0]),  # immune      #c9553f
+        3: np.array([0.247, 0.498, 0.616, 1.0]),  # stroma      #3f7f9d
+        4: np.array([0.722, 0.690, 0.643, 1.0]),  # acellular   #b8b0a4
+    },
+}
+
+
+def _colors_for(tissue_type: str) -> dict[int, np.ndarray]:
+    """3D palette for ``tissue_type``, falling back to the HGSC palette.
+
+    A fallback rather than a KeyError: an unknown tissue type should still
+    render (miscoloured but visible), not refuse to open the viewer.
+    """
+    return _TISSUE_3D_COLORS_BY_TYPE.get(tissue_type, _TISSUE_3D_COLORS)
+
 _DEFAULT_POINT_COLORMAP = "viridis"
 _DEFAULT_COLOR_BY = "area_um2"
 _LEGEND_WIDGET_NAME = "Tissue classes"
@@ -199,6 +225,7 @@ def _build_layers(
 
     label_element = sdata.labels["tissue_labels"]
     scale = _voxel_scale_from_affine(label_element)
+    colors = _colors_for(tissue_type)
 
     try:
         from napari.utils.colormaps import direct_colormap
@@ -212,7 +239,7 @@ def _build_layers(
     viewer.add_labels(
         label_element.data,
         name="tissue_labels",
-        colormap=direct_colormap(_TISSUE_3D_COLORS),
+        colormap=direct_colormap(colors),
         scale=scale,
     )
     layer_names = ["tissue_labels"]
@@ -229,7 +256,7 @@ def _build_layers(
         # Lazy dask comparison + astype -- stays lazy, never .compute()/np.asarray().
         mask = (label_element.data == class_index).astype(np.uint8)
         class_colormap = direct_colormap(
-            {0: _TISSUE_3D_COLORS[0], 1: _TISSUE_3D_COLORS[class_index]}
+            {0: colors[0], 1: colors[class_index]}
         )
         layer_name = f"class_{class_name}"
         viewer.add_labels(
@@ -277,9 +304,10 @@ def _add_legend(viewer: "Any", *, tissue_type: str = "HGSC") -> "Any":
 
     widget = QWidget()
     layout = QVBoxLayout()
+    colors = _colors_for(tissue_type)
     for class_index, class_name in sorted(TISSUE_CLASSES[tissue_type].items()):
         label = QLabel(f"{class_index}: {class_name}")
-        r, g, b, a = _TISSUE_3D_COLORS[class_index]
+        r, g, b, a = colors[class_index]
         label.setStyleSheet(
             f"background-color: rgba({int(r * 255)}, {int(g * 255)}, "
             f"{int(b * 255)}, {int(a * 255)});"

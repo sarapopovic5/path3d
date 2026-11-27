@@ -17,7 +17,8 @@ breaks an install target the other needs:
 ```bash
 pip install "path3d[binaries]"   # bundled openslide + libvips, no system install
 pip install "path3d[viz]"        # interactive 3D viewing (napari + Qt)
-pip install "path3d[all]"        # both of the above
+pip install "path3d[niches]"     # 3D Xenium tissue neighbourhoods from H&E
+pip install "path3d[all]"        # all of the above
 ```
 
 Registration requires a Java runtime (VALIS uses Bio-Formats).
@@ -200,6 +201,20 @@ run_quantification(
 Pass `--section-thickness-um` and `--sampling-interval` to `run_full.py` too; the
 run records them, so `build_volume_from_run` reuses them when given neither.
 
+### Development environment (conda)
+
+`environment.yml` builds an env with every extra installed and a bundled JDK,
+so VALIS registration works without a system Java:
+
+```bash
+conda env create -f environment.yml
+conda activate path3d
+```
+
+Python dependencies are not duplicated in `environment.yml` — it installs the
+project with `pip install -e .[all,dev]`, so `pyproject.toml` stays the single
+source of truth.
+
 ## Supported formats
 
 | Format | Extension | Backend |
@@ -211,6 +226,49 @@ run records them, so `build_volume_from_run` reuses them when given neither.
 | 3DHISTECH MRXS | `.mrxs` | openslide |
 | Zeiss CZI | `.czi` | aicspylibczi *(optional)* |
 
+## 3D tissue neighbourhoods
+
+`path3d.niches` predicts Xenium-derived tissue neighbourhoods
+(`epithelium | immune | stroma | acellular`) from H&E alone and stacks the
+per-section maps into a 3D volume, using path3d's registration to co-register
+the sections:
+
+```python
+from path3d.niches import run_niche_pipeline
+
+sdata = run_niche_pipeline(
+    "manifest.csv",
+    "run_out/registered",   # from pipeline.run_pipeline
+    "run_out/niches",
+    z_spacing_um=12.0,      # spacing between CONSECUTIVE manifest rows
+    smooth_um=100.0,
+)
+```
+
+You get a `(c, z, y, x)` probability volume and a `(z, y, x)` argmax label
+volume. Prefer the probabilities for anything you report — a global argmax
+under-calls rare classes.
+
+The classifier and its stain normaliser are vendored from the Cook Lab
+`2026_final_xenium_analysis` package.
+[`docs/niches/MODEL_CARD.md`](docs/niches/MODEL_CARD.md) is their model card,
+unmodified, and is the authority on validation and limits — **HGSC only**, one
+scanner. [`docs/niches/INTEGRATION.md`](docs/niches/INTEGRATION.md) covers the
+resolution, z-pitch and argmax decisions the 3D path adds.
+
+Requires Hugging Face access to the gated
+[`MahmoodLab/UNI2-h`](https://huggingface.co/MahmoodLab/UNI2-h) (request access,
+then `hf auth login`).
+
+## Tests
+
+```bash
+pytest tests/                                    # no data needed
+pytest tests/ --ome-tiff /path/to/0000.ome.tiff  # + one registered section
+```
+
+Tests that need real slides take the path at runtime and skip without it — no
+data location is ever committed.
 
 ## License
 

@@ -88,6 +88,15 @@ binaries = [
     "openslide-bin",  # bundles libopenslide
     "pyvips-binary",  # bundles libvips
 ]
+# Xenium tissue-neighbourhood prediction (path3d.niches). scikit-learn is
+# needed to unpickle the bundled LogisticRegression. Everything else it uses
+# (timm and huggingface_hub for the gated MahmoodLab/UNI2-h encoder, which
+# needs `hf auth login`; zarr; spatialdata) is already a core dependency.
+niches = [
+    "scikit-learn",
+    "joblib",
+    "tifffile",
+]
 # Interactive viewing. Optional because napari[pyqt5] pulls in PyQt5 and the
 # whole Qt5 runtime, which is dead weight on a headless compute node.
 #
@@ -109,6 +118,7 @@ dev = ["pytest", "ruff", "matplotlib"]
 all = [
     "path3d[binaries]",
     "path3d[viz]",
+    "path3d[niches]",
 ]
 
 [project.urls]
@@ -118,3 +128,12 @@ Issues = "https://github.com/sarapopovic5/path3d/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/path3d"]
+# The niche classifier is the only non-code asset that must ship in the wheel;
+# path3d.niches.predict resolves it relative to its own __file__.
+artifacts = ["src/path3d/niches/models/*.joblib"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: needs real data and/or the gated UNI2-h encoder",
+]
