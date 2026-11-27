@@ -682,6 +682,10 @@ def run_pipeline(
     section_thickness_um: float | None = None,
     sampling_interval: int | None = None,
     segment_first: bool = True,
+    niches: bool = False,
+    niche_step_um: float | None = None,
+    niche_voxel_um: float | None = None,
+    niche_smooth_um: float = 0.0,
 ) -> list[dict]:
     """Run the full pipeline over all sections in the manifest, through the 3D
     volume and its quantification report.
@@ -734,6 +738,12 @@ def run_pipeline(
             itself, the registered H&E, nuclei, the volume and its
             quantification are unchanged. On by default; pass False to
             segment the registered image instead.
+        niches: Also predict tissue neighbourhoods (``path3d.niches``) and
+            build the niche volume under output_dir/neighbourhoods/, as
+            stages 4 and 5 of a staged run do (see ``run_niches_stage``).
+        niche_step_um, niche_voxel_um, niche_smooth_um: the niche tile step,
+            cube size and in-plane smoothing; see ``run_niches_stage`` and
+            ``run_niches_volume_stage``.
 
     Returns:
         List of per-section result dicts in section order. Each dict
@@ -774,6 +784,14 @@ def run_pipeline(
     volume_path = output_dir / f"volume_{voxel_um:g}um.zarr"
     if seg_model is not None:
         _check_no_volume(output_dir, voxel_um)
+    niche_encoder = None
+    if niches:
+        niche_step = _niche_step(niche_step_um)
+        _check_niche_grid(
+            voxel_um,
+            niche_step,
+            float(niche_voxel_um) if niche_voxel_um is not None else niche_step,
+        )
 
     slide_paths = io.load_manifest(manifest_path)
     seg_model_obj, num_classes = _load_seg_model(seg_model, num_classes, tissue_type)
@@ -810,23 +828,48 @@ def run_pipeline(
             tissue_type=tissue_type,
             segment_first=segment_first,
         )
+        if niches:
+            # While the JVM is still up: the niche model's own warp, then its
+            # predictions, as stage 4 does per section
+            niche_encoder = _niche_section(
+                output_dir,
+                manifest_path,
+                result["section_index"],
+                path,
+                slides.get(result["section_index"]),
+                target_mpp=niche_mpp(all_results[0].get("level0_mpp")),
+                reg_mpp=reg_mpp,
+                do_non_rigid=do_non_rigid,
+                step_um=niche_step,
+                stride=1,
+                device=seg_device,
+                keep_warp=False,
+                encoder=niche_encoder,
+            )
 
     _kill_jvm()
 
     if seg_model_obj is None:
         print("[INFO] Segmentation skipped: no label maps, so no 3D volume or quantification.")
-        return all_results
+    else:
+        _build_and_quantify(
+            output_dir,
+            manifest_path,
+            voxel_um=voxel_um,
+            volume_path=volume_path,
+            section_thickness_um=section_thickness_um,
+            sampling_interval=sampling_interval,
+            detect_nuclei=detect_nuclei,
+            tissue_type=tissue_type,
+        )
 
-    _build_and_quantify(
-        output_dir,
-        manifest_path,
-        voxel_um=voxel_um,
-        volume_path=volume_path,
-        section_thickness_um=section_thickness_um,
-        sampling_interval=sampling_interval,
-        detect_nuclei=detect_nuclei,
-        tissue_type=tissue_type,
-    )
+    if niches:
+        run_niches_volume_stage(
+            output_dir,
+            niche_voxel_um=niche_voxel_um,
+            voxel_um=voxel_um,
+            smooth_um=niche_smooth_um,
+        )
 
     return all_results
 
@@ -1013,4 +1056,328 @@ def run_volume_stage(
         sampling_interval=interval,
         detect_nuclei=detect_nuclei,
         tissue_type=meta["tissue_type"],
+    )
+
+
+# Tissue neighbourhoods (path3d.niches). A second labelling of the same
+# registered stack, beside the DPT segmentation, so it hangs off the same
+# stage 1:
+#
+#   4. run_niches_stage         (GPU array)  warp each section at native
+#                                            resolution, predict its niches
+#   5. run_niches_volume_stage  (CPU)        niche volume + soft volumetrics,
+#                                            with the DPT run's nuclei
+#
+# Stage 4 needs only stage 1, so it can run alongside stage 2. Stage 5 picks
+# up the nuclei parquet stage 3 writes when it is there.
+#
+# The niche model needs its own warp: it was trained at ~0.22 um/px
+# (cfg.NICHE_TRAIN_MPP), and registered/ is written at cfg.SEG_MPP (0.5), which
+# would give its encoder ~1/5 of the detail. The native-resolution copy lives
+# in registered_native/ only until that section's predictions are on disk.
+
+NICHE_DIR = "neighbourhoods"            # build_niche_run's run directory
+NICHE_WARP_DIR = "registered_native"    # per-section native-resolution warps
+
+
+def niche_mpp(level0_mpp: float | None) -> float:
+    """Resolution to warp a section at for the niche model: its native
+    resolution, but never finer than the model was trained at (the window is
+    resized to the encoder's input anyway, so finer only costs disk)."""
+    if level0_mpp is None:
+        return cfg.NICHE_TRAIN_MPP
+    return max(float(level0_mpp), cfg.NICHE_TRAIN_MPP)
+
+
+def _niche_tiles_dir(output_dir: Path) -> Path:
+    return output_dir / NICHE_DIR / "niches" / "tiles"
+
+
+def _niche_done(output_dir: Path, idx: int) -> bool:
+    """Whether section ``idx`` already has its niche predictions on disk
+    (``predict_sections`` writes the meta JSON last)."""
+    tiles = _niche_tiles_dir(output_dir)
+    return (tiles / f"{idx:04d}_tiles_niches.csv").exists() and (
+        tiles / f"{idx:04d}_meta.json"
+    ).exists()
+
+
+def _warp_for_niches(
+    valis_slide,
+    path: Path,
+    output_dir: Path,
+    idx: int,
+    *,
+    target_mpp: float,
+    reg_mpp: float,
+    do_non_rigid: bool,
+) -> Path | None:
+    """Warp one section at ``target_mpp`` into ``registered_native/``.
+
+    Written under a temporary name and renamed into place, so a job killed
+    mid-warp leaves no truncated file for the next attempt to trust.
+    """
+    dst = output_dir / NICHE_WARP_DIR / f"{idx:04d}.ome.tiff"
+    if dst.exists():
+        return dst
+    if valis_slide is None:
+        return None
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    partial = dst.with_name(f"{idx:04d}.partial.ome.tiff")
+    reg.warp_and_save_section(
+        valis_slide,
+        path,
+        partial,
+        target_mpp=target_mpp,
+        reg_mpp=reg_mpp,
+        non_rigid=do_non_rigid,
+    )
+    partial.replace(dst)
+    return dst
+
+
+def _niche_z_spacing(meta: dict, voxel_um: float | None) -> float:
+    """Microns between consecutive manifest rows, the same spacing the DPT
+    volume uses: thickness x interval from stage 1, else ``voxel_um``."""
+    return _resolve_run_voxel_um(
+        voxel_um, meta.get("section_thickness_um"), meta.get("sampling_interval")
+    )
+
+
+def _check_niche_grid(z_um: float, step_um: float, voxel_um: float) -> None:
+    """Raise now, before hours of GPU work, on a cube ``build_niche_volume``
+    would refuse at the end."""
+    from path3d.niches.volume import _z_bin_factor
+
+    if step_um <= 0:
+        raise ValueError(f"niche step must be > 0, got {step_um}")
+    if voxel_um > step_um:
+        raise ValueError(
+            f"niche voxel ({voxel_um:g} um) is coarser than the tile step "
+            f"({step_um:g} um); predict at a step of {voxel_um:g} um instead."
+        )
+    _z_bin_factor(z_um, voxel_um)
+
+
+def _niche_section(
+    output_dir: Path,
+    manifest_csv: str | Path,
+    idx: int,
+    path: Path,
+    valis_slide,
+    *,
+    target_mpp: float,
+    reg_mpp: float,
+    do_non_rigid: bool,
+    step_um: float,
+    stride: int,
+    device: str | None,
+    keep_warp: bool,
+    encoder=None,
+):
+    """Warp one section at native resolution, predict its niches, then drop
+    the warp once its predictions landed (unless ``keep_warp``).
+
+    One section at a time, so each process holds at most one native warp on
+    disk. Returns the UNI2-h encoder, loaded on first use, to pass back in for
+    the next section.
+    """
+    from path3d.niches import pipeline as npl
+    from path3d.niches import predict as npredict
+
+    native = _warp_for_niches(
+        valis_slide,
+        path,
+        output_dir,
+        idx,
+        target_mpp=target_mpp,
+        reg_mpp=reg_mpp,
+        do_non_rigid=do_non_rigid,
+    )
+    if native is None:
+        print(f"[WARN] [{idx:04d}] not registered, so no niche prediction.")
+        return encoder
+    if encoder is None:
+        encoder = npredict.load_encoder(device)
+    npl.predict_sections(
+        manifest_csv,
+        output_dir / NICHE_WARP_DIR,
+        output_dir / NICHE_DIR / "niches",
+        step_um=step_um,
+        stride=stride,
+        section_indices=[idx],
+        device=device,
+        encoder=encoder,
+    )
+    if not keep_warp and _niche_done(output_dir, idx):
+        native.unlink(missing_ok=True)
+    return encoder
+
+
+def _niche_step(step_um: float | None) -> float:
+    """The tile step; the model's own tile size (32 um) when None."""
+    if step_um is not None:
+        return float(step_um)
+    from path3d.niches.predict import load_model
+
+    return float(load_model().tile_um)
+
+
+def run_niches_stage(
+    output_dir: str | Path,
+    *,
+    task_index: int = 0,
+    n_tasks: int = 1,
+    step_um: float | None = None,
+    niche_voxel_um: float | None = None,
+    voxel_um: float | None = None,
+    stride: int = 1,
+    device: str | None = None,
+    keep_warp: bool = False,
+) -> list[int]:
+    """Stage 4 of a staged run: niche predictions for this task's share of
+    the sections (``task_sections``).
+
+    Each section is warped from its original slide at ``niche_mpp`` into
+    ``registered_native/`` (reusing the registration stage 1 saved), then
+    the niche model predicts tiles into ``neighbourhoods/niches/tiles/``.
+    Sections with predictions on disk are skipped and an interrupted one
+    resumes from its embedding checkpoint, so a failed task can simply be
+    resubmitted.
+
+    Args:
+        output_dir: the run directory stage 1 registered into.
+        task_index, n_tasks: this task's share, as ``run_sections_stage``.
+        step_um: spacing of tile centres, which is the niche volume's
+            in-plane grid; the model's 32 um tile when None. Pass the same
+            value to every task.
+        niche_voxel_um: cube size the niche volume stage will build, checked
+            here so a bad value fails before the GPU work; ``step_um`` when
+            None.
+        voxel_um: section spacing when stage 1 recorded no thickness and
+            interval, as for ``run_volume_stage``.
+        stride: preview only: every Nth tile per axis. Use its own run
+            directory.
+        device: torch device for the encoder; picked automatically when None.
+        keep_warp: keep ``registered_native/NNNN.ome.tiff`` after the section
+            is predicted. Off by default: each is several times the size of
+            its ``registered/`` counterpart.
+
+    Returns:
+        The section indices predicted now.
+    """
+    output_dir = Path(output_dir)
+    meta = _read_run_metadata(output_dir)
+    slide_paths = io.load_manifest(meta["manifest_csv"])
+
+    step = _niche_step(step_um)
+    _check_niche_grid(
+        _niche_z_spacing(meta, voxel_um),
+        step,
+        float(niche_voxel_um) if niche_voxel_um is not None else step,
+    )
+
+    mine = task_sections(len(slide_paths), task_index, n_tasks)
+    todo = [idx for idx in mine if not _niche_done(output_dir, idx)]
+    target_mpp = niche_mpp(meta.get("level0_mpp"))
+    print(f"[INFO] Niches task {task_index} of {n_tasks}: sections {list(mine)}, "
+          f"{len(mine) - len(todo)} already done; warping at {target_mpp:g} um/px, "
+          f"tiles every {step:g} um")
+    if not todo:
+        return []
+
+    need_warp = [
+        idx for idx in todo
+        if not (output_dir / NICHE_WARP_DIR / f"{idx:04d}.ome.tiff").exists()
+    ]
+    slides = reg.load_registered_slides(output_dir, need_warp) if need_warp else {}
+    encoder = None
+    for idx in todo:
+        encoder = _niche_section(
+            output_dir,
+            meta["manifest_csv"],
+            idx,
+            slide_paths[idx],
+            slides.get(idx),
+            target_mpp=target_mpp,
+            reg_mpp=meta["registration_mpp"],
+            do_non_rigid=meta["do_non_rigid"],
+            step_um=step,
+            stride=stride,
+            device=device,
+            keep_warp=keep_warp,
+            encoder=encoder,
+        )
+    if need_warp:
+        _kill_jvm()
+    return [idx for idx in todo if _niche_done(output_dir, idx)]
+
+
+def _recorded_niche_step(output_dir: Path) -> float:
+    """The tile step the niche stage predicted at, from its tile metadata."""
+    metas = sorted(_niche_tiles_dir(output_dir).glob("*_meta.json"))
+    if not metas:
+        raise FileNotFoundError(
+            f"No niche predictions under {_niche_tiles_dir(output_dir)}. Run "
+            f"the niches stage first."
+        )
+    meta = json.loads(metas[0].read_text())
+    return float(meta.get("step_um", meta.get("tile_um")))
+
+
+def run_niches_volume_stage(
+    output_dir: str | Path,
+    *,
+    niche_voxel_um: float | None = None,
+    voxel_um: float | None = None,
+    smooth_um: float = 0.0,
+    allow_missing: bool = False,
+) -> Path:
+    """Stage 5 of a staged run: the niche volume, once every niches task has
+    finished.
+
+    Writes ``neighbourhoods/`` in ``niches.run.build_niche_run``'s layout:
+    ``volume_niches_{v}um.zarr`` (probabilities + argmax labels), per-section
+    label maps and ``quantification/soft_volumetrics.csv``. The z spacing is
+    the DPT volume's; the in-plane grid is the step the niches stage
+    predicted at. When stage 3 has written ``nuclei_{z}um.parquet`` those
+    nuclei are attached too.
+
+    Args:
+        niche_voxel_um: cube size; the tile step when None. A whole multiple
+            of the section spacing and no coarser than the step.
+        voxel_um: section spacing when stage 1 recorded none, as for
+            ``run_volume_stage``.
+        smooth_um: in-plane Gaussian on the probabilities before the argmax
+            (see ``build_niche_volume``); 0 is off.
+        allow_missing: build even if some sections have no prediction.
+
+    Returns:
+        Path of the written zarr.
+    """
+    from path3d.niches.run import build_niche_run
+
+    output_dir = Path(output_dir)
+    meta = _read_run_metadata(output_dir)
+    z_um = _niche_z_spacing(meta, voxel_um)
+    step = _recorded_niche_step(output_dir)
+    cube = float(niche_voxel_um) if niche_voxel_um is not None else step
+    _check_niche_grid(z_um, step, cube)
+
+    parquet = output_dir / f"nuclei_{z_um:g}um.parquet"
+    if not parquet.exists():
+        print(f"[INFO] {parquet.name} not found; the niche volume carries no nuclei.")
+        parquet = None
+
+    return build_niche_run(
+        meta["manifest_csv"],
+        output_dir / NICHE_WARP_DIR,
+        output_dir / NICHE_DIR,
+        z_spacing_um=z_um,
+        step_um=step,
+        voxel_um=cube,
+        smooth_um=smooth_um,
+        nuclei_parquet=parquet,
+        allow_missing=allow_missing,
+        predict=False,
     )

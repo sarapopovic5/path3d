@@ -44,7 +44,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from path3d.config import TISSUE_CLASS_COLORS
+from path3d.config import NICHE_TRAIN_MPP, TISSUE_CLASS_COLORS
 from path3d.niches.pipeline import load_sections, predict_sections
 from path3d.niches.predict import load_model
 from path3d.niches.quantify import per_section_profile, soft_volumetrics
@@ -57,7 +57,7 @@ TISSUE_TYPE = "HGSC_niches"
 # The niche model was trained at this level-0 resolution. Coarser registered
 # sections still produce the right PHYSICAL window (112 um), just with less
 # detail in it than the encoder saw in training.
-_TRAINING_MPP = 0.2201
+_TRAINING_MPP = NICHE_TRAIN_MPP
 
 
 def write_label_maps(labels: np.ndarray, out_dir: Path) -> None:

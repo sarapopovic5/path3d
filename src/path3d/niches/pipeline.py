@@ -19,9 +19,10 @@ the Bio-Formats JPEGXR segfault on this dataset.
 Resolution matters here. The model takes a 112 um window and resizes it to
 224x224, so at the default ``cfg.SEG_MPP`` of 0.5 um/px that window is already
 224 px and carries visibly less detail than the 509 px UNI2-h saw in training.
-Warp at the slide's native mpp (~0.22) for the niche pass; the output is
-pyramidal, so ``segmentation.predict_section`` can still pick a ~0.44 um/px
-level off the same file and you only pay for one warp.
+Warp at the slide's native mpp (~0.22) for the niche pass. The staged run
+(``pipeline.run_niches_stage``) does this itself: it warps each section a
+second time, at ``max(level-0 mpp, cfg.NICHE_TRAIN_MPP)``, into
+``registered_native/``, and predicts from those.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ def predict_sections(
     skip_existing: bool = True,
     cache_embeddings: bool = True,
     verbose: bool = True,
+    encoder=None,
 ) -> dict[str, dict]:
     """Run the niche model over every registered section in a manifest.
 
@@ -104,6 +106,8 @@ def predict_sections(
             restart; it also lets the classifier be re-run later without
             paying for the encoder again.
         verbose: log progress.
+        encoder: a :func:`load_encoder` result to reuse across calls; loaded
+            on first use when None.
 
     Returns:
         ``str(manifest path)`` -> metadata dict, for sections that produced
@@ -123,7 +127,6 @@ def predict_sections(
     step = float(step_um) if step_um is not None else model.tile_um
     wanted = set(range(len(paths))) if section_indices is None else set(section_indices)
 
-    encoder = None
     metas: dict[str, dict] = {}
 
     for index, path in enumerate(paths):
