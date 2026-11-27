@@ -15,6 +15,7 @@ class _Slide:
     """An open slide: level-0 size and resolution only."""
 
     level_dimensions = ((_LEVEL0_RC[1], _LEVEL0_RC[0]),)  # (w, h)
+    level_downsamples = (1.0,)
 
     def __enter__(self):
         return self
@@ -41,7 +42,7 @@ class _ValisSlide:
 def fake_stack(monkeypatch):
     """Replace slide reading, VALIS, segmentation and Cellpose with stand-ins
     whose outputs depend on the section, and count the per-section calls."""
-    calls = {"segment": [], "nuclei": []}
+    calls = {"segment": [], "nuclei": [], "seg_mpp": [], "label_warp": []}
 
     monkeypatch.setattr(pl.io, "open_slide", lambda path: _Slide())
     monkeypatch.setattr(pl.pr, "downsample_to_mpp",
@@ -56,7 +57,14 @@ def fake_stack(monkeypatch):
 
     def predict(path, model, mask, *, section_idx, **kw):
         calls["segment"].append(section_idx)
+        calls["seg_mpp"].append(kw.get("seg_mpp"))
         return np.full((6, 6), section_idx % 5, np.uint8)
+
+    def warp_labels(slide, labels, **kw):
+        calls["label_warp"].append(slide.idx)
+        return np.pad(labels, 1)  # a canvas a little larger than the section
+
+    monkeypatch.setattr(pl.reg, "warp_label_map_to_registered", warp_labels)
 
     def detect(path, **kw):
         idx = int(path.stem[1:])  # s{i}.czi
@@ -121,6 +129,43 @@ def test_staged_run_writes_what_run_pipeline_writes(tmp_path, make_manifest, fak
         kw.pop("volume_path")
     assert built[0] == built[1]
     assert built[1]["voxel_um"] == 8.0 and built[1]["sampling_interval"] == 2
+
+
+def test_segment_first_segments_the_original_and_warps_its_labels(
+    tmp_path, make_manifest, fake_stack, monkeypatch,
+):
+    manifest = make_manifest(3)
+    monkeypatch.setattr(pl, "_build_and_quantify", lambda out, m, **kw: None)
+
+    staged = tmp_path / "staged"
+    pl.run_register_stage(manifest, staged, segment_first=True)
+    assert pl._read_run_metadata(staged)["segment_first"] is True
+    pl.run_sections_stage(staged, seg_model=_MODEL, num_classes=5, seg_device="cpu")
+
+    # Segmented at the original slide's own resolution, not the 0.5 canvas
+    assert fake_stack["seg_mpp"] == [pytest.approx(0.2201)] * 3
+    assert fake_stack["label_warp"] == [0, 1, 2]
+    for idx in range(3):
+        raw = np.asarray(pl.Image.open(staged / "label_maps_raw" / f"{idx:04d}_labels.png"))
+        warped = np.asarray(pl.Image.open(staged / "label_maps" / f"{idx:04d}_labels.png"))
+        assert raw.shape == (6, 6) and (raw == idx % 5).all()
+        assert warped.shape == (8, 8) and (warped[1:-1, 1:-1] == idx % 5).all()
+
+    # One process gives the same files
+    single = tmp_path / "single"
+    pl.run_pipeline(manifest, single, seg_model=_MODEL, num_classes=5, seg_device="cpu",
+                    segment_first=True)
+    assert _outputs(single)[0] == _outputs(staged)[0]
+
+
+def test_runs_registered_without_segment_first_segment_the_registered_image(
+    tmp_path, make_manifest, fake_stack,
+):
+    out = tmp_path / "run"
+    pl.run_register_stage(make_manifest(2), out)
+    pl.run_sections_stage(out, seg_model=_MODEL, num_classes=5, seg_device="cpu")
+    assert fake_stack["label_warp"] == []
+    assert not (out / "label_maps_raw").exists()
 
 
 def test_a_rerun_task_skips_finished_sections(tmp_path, make_manifest, fake_stack):

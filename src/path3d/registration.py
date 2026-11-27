@@ -481,14 +481,9 @@ def warp_and_save_section(
 
     level = _source_level_for_mpp(reader, target_mpp)
 
-    aligned_shape_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
-
-    crop_method = slide.get_crop_method(crop)
-    bbox_xywh = None
-    if crop_method is not False:
-        bbox_xywh = slide.get_crop_xywh(
-            crop=crop_method, out_shape_rc=aligned_shape_rc
-        )[0]
+    aligned_shape_rc, bbox_xywh = _registered_canvas_and_crop(
+        slide, reg_mpp, target_mpp, crop
+    )
 
     warped = _valis_st.warp_slide(
         src_path_str,
@@ -550,6 +545,85 @@ def _registered_canvas_shape_rc(
     return np.ceil(
         np.asarray(slide.aligned_slide_shape_rc, dtype=float) * scale
     ).astype(int)
+
+
+def _registered_canvas_and_crop(
+    slide: Any, reg_mpp: float, target_mpp: float, crop: bool | str,
+) -> tuple[np.ndarray, Any]:
+    """Uncropped canvas shape at ``target_mpp`` and the crop box VALIS cuts
+    from it (None when ``crop`` turns cropping off). Shared by the image and
+    label-map warps so both land on the identical canvas."""
+    aligned_shape_rc = _registered_canvas_shape_rc(slide, reg_mpp, target_mpp)
+    crop_method = slide.get_crop_method(crop)
+    bbox_xywh = None
+    if crop_method is not False:
+        bbox_xywh = slide.get_crop_xywh(
+            crop=crop_method, out_shape_rc=aligned_shape_rc
+        )[0]
+    return aligned_shape_rc, bbox_xywh
+
+
+def warp_label_map_to_registered(
+    slide: Any,
+    label_map: np.ndarray,
+    *,
+    reg_mpp: float = cfg.REG_MPP,
+    target_mpp: float = cfg.SEG_MPP,
+    non_rigid: bool = True,
+    crop: bool | str = True,
+) -> np.ndarray:
+    """Warp a label map segmented on the ORIGINAL slide into the registered
+    canvas, with nearest-neighbour so no class value is invented.
+
+    ``label_map`` must cover the original slide's full extent (the frame of
+    ``slide_io`` readers: origin at the scan's bounding box) at any pyramid
+    level; VALIS scales the transform from its shape, exactly as it does for
+    the pyramid level ``warp_and_save_section`` reads. The output is the
+    canvas and crop of that function at ``target_mpp``, so the result lines up
+    pixel for pixel with the registered OME-TIFF and with nuclei mapped by
+    ``warp_points_to_registered``. Outside the warped section it is 0 (space).
+
+    Args:
+        slide: VALIS slide object from ``register()`` (or a reloaded registrar).
+        label_map: (H, W) integer class labels, values 0-255.
+        reg_mpp: the ``elastic_mpp`` the slide was registered with.
+        target_mpp: resolution of the registered canvas (``seg_mpp``).
+        non_rigid: include the elastic displacement field.
+        crop: crop flag/name, as for ``warp_and_save_section``.
+
+    Returns:
+        (H', W') uint8 label map on the registered canvas at ``target_mpp``.
+
+    Raises:
+        ValueError: ``label_map`` is not 2D or has values outside 0-255.
+    """
+    import pyvips
+    from valis import warp_tools as _valis_wt
+
+    label_map = np.asarray(label_map)
+    if label_map.ndim != 2:
+        raise ValueError(f"label_map must be 2D, got shape {label_map.shape}")
+    if label_map.size and (label_map.min() < 0 or label_map.max() > 255):
+        raise ValueError("label_map values must be in 0-255 to warp as uint8")
+
+    aligned_shape_rc, bbox_xywh = _registered_canvas_and_crop(
+        slide, reg_mpp, target_mpp, crop
+    )
+    src = pyvips.Image.new_from_array(np.ascontiguousarray(label_map, dtype=np.uint8))
+    warped = _valis_wt.warp_img(
+        img=src,
+        M=slide.M,
+        bk_dxdy=(slide.bk_dxdy if non_rigid else None),
+        transformation_src_shape_rc=slide.processed_img_shape_rc,
+        transformation_dst_shape_rc=slide.reg_img_shape_rc,
+        out_shape_rc=aligned_shape_rc,
+        bbox_xywh=bbox_xywh,
+        bg_color=None,  # 0 outside the section = space
+        interp_method="nearest",
+    )
+    if isinstance(warped, pyvips.Image):
+        warped = warped.numpy()
+    return np.asarray(warped, dtype=np.uint8).reshape(warped.shape[:2])
 
 
 def warp_points_to_registered(
