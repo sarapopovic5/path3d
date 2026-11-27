@@ -282,7 +282,7 @@ def _write_volume_build_inputs(
     sampling_interval: int | None,
     do_non_rigid: bool,
     tissue_type: str,
-    segment_first: bool = False,
+    segment_first: bool = True,
 ) -> None:
     """Persist registration transforms + volume-build scalars
 
@@ -425,7 +425,7 @@ def _register_stack(
     sampling_interval: int | None,
     tissue_type: str,
     strict: bool,
-    segment_first: bool = False,
+    segment_first: bool = True,
 ) -> tuple[dict[int, object], list[dict]]:
     """Per-slide tissue masks, then VALIS over the whole stack, then the
     volume-build inputs (transforms + metadata) on disk.
@@ -503,7 +503,7 @@ def _process_section(
     reg_mpp: float,
     do_non_rigid: bool,
     tissue_type: str,
-    segment_first: bool = False,
+    segment_first: bool = True,
 ) -> None:
     """Warp, segment and detect nuclei in one section, write its outputs and
     release them from ``result`` (mutated in place).
@@ -681,7 +681,7 @@ def run_pipeline(
     voxel_um: float | None = None,
     section_thickness_um: float | None = None,
     sampling_interval: int | None = None,
-    segment_first: bool = False,
+    segment_first: bool = True,
 ) -> list[dict]:
     """Run the full pipeline over all sections in the manifest, through the 3D
     volume and its quantification report.
@@ -732,7 +732,8 @@ def run_pipeline(
             canvas, instead of segmenting the registered OME-TIFF. The raw
             label maps are kept in output_dir/label_maps_raw/. Registration
             itself, the registered H&E, nuclei, the volume and its
-            quantification are unchanged.
+            quantification are unchanged. On by default; pass False to
+            segment the registered image instead.
 
     Returns:
         List of per-section result dicts in section order. Each dict
@@ -866,7 +867,7 @@ def run_register_stage(
     voxel_um: float | None = None,
     section_thickness_um: float | None = None,
     sampling_interval: int | None = None,
-    segment_first: bool = False,
+    segment_first: bool = True,
 ) -> list[dict]:
     """Stage 1 of a staged run: register the stack and record the run's
     settings, ``segment_first`` included. Arguments as for ``run_pipeline``.

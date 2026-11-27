@@ -1,6 +1,8 @@
 """The staged run (register -> sections array -> volume) does the same work as
 run_pipeline in one process, split so the GPU stage can run as a Slurm array."""
 
+import json
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -162,7 +164,29 @@ def test_runs_registered_without_segment_first_segment_the_registered_image(
     tmp_path, make_manifest, fake_stack,
 ):
     out = tmp_path / "run"
+    pl.run_register_stage(make_manifest(2), out, segment_first=False)
+    pl.run_sections_stage(out, seg_model=_MODEL, num_classes=5, seg_device="cpu")
+    assert fake_stack["label_warp"] == []
+    assert not (out / "label_maps_raw").exists()
+
+
+def test_segment_first_is_the_default(tmp_path, make_manifest, fake_stack):
+    out = tmp_path / "run"
     pl.run_register_stage(make_manifest(2), out)
+    assert pl._read_run_metadata(out)["segment_first"] is True
+    pl.run_sections_stage(out, seg_model=_MODEL, num_classes=5, seg_device="cpu")
+    assert (out / "label_maps_raw").exists()
+
+
+def test_runs_registered_before_segment_first_existed_keep_the_old_behaviour(
+    tmp_path, make_manifest, fake_stack,
+):
+    out = tmp_path / "run"
+    pl.run_register_stage(make_manifest(2), out)
+    meta_path = out / "volume_build_metadata.json"
+    meta = json.loads(meta_path.read_text())
+    del meta["segment_first"]
+    meta_path.write_text(json.dumps(meta))
     pl.run_sections_stage(out, seg_model=_MODEL, num_classes=5, seg_device="cpu")
     assert fake_stack["label_warp"] == []
     assert not (out / "label_maps_raw").exists()
