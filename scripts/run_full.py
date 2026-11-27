@@ -80,11 +80,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--segment-first",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="segment each original slide at the training resolution, then "
-        "warp the label map onto the registered canvas, instead of segmenting "
-        "the registered image. The register stage records it; the sections "
-        "stage follows that record",
+        "warp the label map onto the registered canvas (the default). "
+        "--no-segment-first segments the registered image instead. The "
+        "register stage records it; the sections stage follows that record",
     )
     parser.add_argument(
         "--persist-nuclei-masks",
